@@ -1,0 +1,33 @@
+# Gradle & build outputs
+.gradle/
+build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Local SDK / machine config
+local.properties
+
+# IDE files
+*.iml
+.idea/
+
+# Binaries, signing keys & telemetry dumps
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+*.jks
+*.keystore
+*.log
+*.csv
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local scratch prompt file
+First_run.md

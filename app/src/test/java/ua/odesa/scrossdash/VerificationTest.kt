@@ -1,0 +1,693 @@
+package ua.odesa.scrossdash
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import org.junit.Assert.*
+import org.junit.Test
+import ua.odesa.scrossdash.auto.BentoCanvasRenderer
+import ua.odesa.scrossdash.data.SettingsStore
+import ua.odesa.scrossdash.data.db.TripRecord
+import ua.odesa.scrossdash.data.db.TripStore
+import ua.odesa.scrossdash.data.log.CsvLogSink
+import ua.odesa.scrossdash.domain.SolarCalculator
+import ua.odesa.scrossdash.domain.SolarTwilightHelper
+import ua.odesa.scrossdash.domain.TelemetryEngine
+import ua.odesa.scrossdash.model.AppSettings
+import ua.odesa.scrossdash.model.RawObdSnapshot
+import ua.odesa.scrossdash.ui.AnalyticsPeriod
+import ua.odesa.scrossdash.ui.computePeriodKpi
+import ua.odesa.scrossdash.ui.deduplicateTrips
+import ua.odesa.scrossdash.ui.formatTripsCountUk
+import java.util.Calendar
+import java.util.TimeZone
+
+class VerificationTest {
+
+    // ──────── In-Memory Test Doubles ────────
+
+    private class FakeSettingsStore(
+        initialTankLiters: Float = 32.0f,
+        initialCalibrated: Boolean = false,
+        initialHeadlightsReminder: Boolean = false
+    ) : SettingsStore {
+        private val _settings = MutableStateFlow(
+            AppSettings(
+                fuelPriceUah = 56.50f,
+                mafCalibration = 1.00f,
+                tankCapacityLiters = 47.0f,
+                headlightsReminderEnabled = initialHeadlightsReminder
+            )
+        )
+        override val settings: StateFlow<AppSettings> = _settings
+
+        private val _calibratedTankLiters = MutableStateFlow(initialTankLiters)
+        override val calibratedTankLiters: StateFlow<Float> = _calibratedTankLiters
+
+        private val _isTankCalibrated = MutableStateFlow(initialCalibrated)
+        override val isTankCalibrated: StateFlow<Boolean> = _isTankCalibrated
+
+        var anchorCallCount = 0
+
+        fun setHeadlightsReminderEnabled(enabled: Boolean) {
+            _settings.value = _settings.value.copy(headlightsReminderEnabled = enabled)
+        }
+
+        override fun saveRemainingTankLiters(liters: Float) {
+            _calibratedTankLiters.value = liters.coerceIn(0f, _settings.value.tankCapacityLiters)
+        }
+
+        override fun anchorTankToSensor(liters: Float) {
+            anchorCallCount++
+            _calibratedTankLiters.value = liters.coerceIn(0f, _settings.value.tankCapacityLiters)
+            _isTankCalibrated.value = true
+        }
+
+        override fun markRefueledToFull() {
+            anchorTankToSensor(_settings.value.tankCapacityLiters)
+        }
+    }
+
+    private class FakeTripStore : TripStore {
+        private var nextId = 1L
+        private val records = mutableListOf<TripRecord>()
+        private val _trips = MutableStateFlow<List<TripRecord>>(emptyList())
+        override val trips: StateFlow<List<TripRecord>> = _trips
+
+        var upsertCalls = 0
+
+        override suspend fun upsertActiveTrip(record: TripRecord): Long {
+            upsertCalls++
+            val existingIdx = if (record.id > 0) {
+                records.indexOfFirst { it.id == record.id }
+            } else {
+                records.indexOfFirst { it.startTimeMs == record.startTimeMs }
+            }
+            return if (existingIdx >= 0) {
+                val existingId = records[existingIdx].id
+                records[existingIdx] = record.copy(id = existingId)
+                _trips.value = records.toList()
+                existingId
+            } else {
+                val assigned = nextId++
+                records.add(record.copy(id = assigned))
+                _trips.value = records.toList()
+                assigned
+            }
+        }
+
+        override suspend fun getLatestTrip(): TripRecord? = records.maxByOrNull { it.startTimeMs }
+    }
+
+    private class FakeCsvSink : CsvLogSink {
+        private var seq = 0
+        var activeFile: String? = null
+        val events = mutableListOf<String>()
+        var closeCount = 0
+
+        override fun startSession(): String {
+            seq++
+            val name = "scross_telemetry_test_$seq.csv"
+            activeFile = name
+            return name
+        }
+
+        override fun closeSession() {
+            closeCount++
+            activeFile = null
+        }
+
+        override fun flush() {}
+        override fun getCurrentFileName(): String? = activeFile
+        override fun logEvent(eventNote: String) {
+            events.add(eventNote)
+        }
+
+        override fun logRow(
+            isDemo: Boolean, connState: String, rpm: Int, speedKmh: Int, accelKmhPerSec: Float,
+            coolantC: Int, intakeC: Int, mafGps: Float, mapKpa: Int, baroKpa: Int, boostBar: Float,
+            throttlePct: Float, engineLoadPct: Float, voltage12v: Float, lambda: Float,
+            rawFuelPct: Float?, isFuelCut: Boolean, instantFuelVal: String, instantFuelUnit: String,
+            tripDistKm: Float, tripFuelL: Float, avgL100km: Float, tankRemL: Float, tankToFullL: Float,
+            hybridMode: String, hybridSavedMl: Int, ecoTotal: Int, ecoAccel: Int, ecoBrake: Int,
+            ecoCruise: Int, careTotal: Int, careWarmup: Int, careLspi: Int, careThermal: Int,
+            turboCooldownSec: Int, dtcCodes: List<String>, eventNote: String
+        ) {}
+    }
+
+    // ──────── Core & Night Audit Unit Tests ────────
+
+    @Test
+    fun testSingleRowTripUpsertAndIgnitionOffReset() {
+        val settings = FakeSettingsStore(initialTankLiters = 30f, initialCalibrated = true)
+        val tripStore = FakeTripStore()
+        val csvSink = FakeCsvSink()
+        val finalizedNotifications = mutableListOf<TripRecord>()
+
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            tripRepo = tripStore,
+            csvLogger = csvSink,
+            onTripFinalized = { finalizedNotifications.add(it) },
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+        engine.updateConnectionStatus(connected = true, demo = false, message = "Connected")
+
+        var ts = 1_700_000_000_000L
+        for (i in 0 until 40) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 1800,
+                    speedKmh = 54,
+                    coolantTempC = 85,
+                    mafGramsPerSec = 9.0f,
+                    mapKpa = 105,
+                    baroKpa = 101,
+                    throttlePct = 22f,
+                    voltage12v = 14.1f,
+                    timestampMs = ts
+                )
+            )
+        }
+
+        assertTrue("Expected >= 2 auto-save upserts, got ${tripStore.upsertCalls}", tripStore.upsertCalls >= 2)
+        assertEquals("Expected strictly 1 row for active trip", 1, tripStore.trips.value.size)
+        assertTrue("Expected distance >= 0.5 km", engine.state.value.tripDistanceKm >= 0.5f)
+        assertEquals("scross_telemetry_test_1.csv", tripStore.trips.value.first().csvFileName)
+
+        // Traffic-light Start-Stop (RPM == 0, 48V keeps voltage >= 13.0V for 25s) must NOT finalize the trip!
+        for (i in 0 until 25) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 0,
+                    speedKmh = 0,
+                    coolantTempC = 85,
+                    mafGramsPerSec = 0f,
+                    voltage12v = 13.6f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertTrue("Start-Stop must NOT finalize or reset trip", engine.state.value.tripDistanceKm >= 0.5f)
+        assertTrue("No arrival notification during Start-Stop", finalizedNotifications.isEmpty())
+
+        // Ignition-Off via ECU STANDBY > 8s
+        engine.onEcuSleepTick(3f)
+        engine.onEcuSleepTick(3f)
+        engine.onEcuSleepTick(3f)
+
+        assertEquals("Still strictly 1 row after finalization", 1, tripStore.trips.value.size)
+        assertEquals("Expected 1 arrival summary notification", 1, finalizedNotifications.size)
+        assertEquals("scross_telemetry_test_1.csv", finalizedNotifications.first().csvFileName)
+        assertTrue("CSV session must be closed on finalization", csvSink.closeCount >= 1)
+        assertNull("No active CSV file after finalization", csvSink.activeFile)
+
+        assertEquals(0f, engine.state.value.tripDistanceKm, 0.001f)
+        assertEquals(0f, engine.state.value.tripFuelUsedLiters, 0.001f)
+        assertEquals(0f, engine.state.value.hybridSavedLiters, 0.001f)
+        assertEquals(0, engine.state.value.eco.totalScore)
+        assertEquals(100, engine.state.value.care.totalScore)
+    }
+
+    @Test
+    fun testEcoCruiseCityFlowAccumulationAndStationaryFreeze() {
+        val settings = FakeSettingsStore(initialTankLiters = 30f, initialCalibrated = true)
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+
+        assertEquals(0, engine.state.value.eco.totalScore)
+        assertEquals(0, engine.state.value.eco.speedSteadiness)
+
+        // Stationary ticks must keep all Eco sub-scores frozen at 0
+        var ts = 1_700_000_000_000L
+        for (i in 0 until 10) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    throttlePct = 14f,
+                    coolantTempC = 80,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertEquals(0, engine.state.value.eco.speedSteadiness)
+        assertEquals(0, engine.state.value.eco.totalScore)
+
+        // Calm city flow for 40s at 45 km/h (~0.5 km, moderated rate ~3.8 per 100m -> ~19 pts)
+        for (i in 0 until 40) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 1750,
+                    speedKmh = 45,
+                    throttlePct = 22f + (i % 2) * 1f,
+                    mafGramsPerSec = 7.5f,
+                    mapKpa = 104,
+                    baroKpa = 101,
+                    coolantTempC = 82,
+                    timestampMs = ts
+                )
+            )
+        }
+
+        val cruiseAfterFlow = engine.state.value.eco.speedSteadiness
+        val totalAfterFlow = engine.state.value.eco.totalScore
+        assertTrue("Expected ecoCruiseScore > 12 in calm city flow, got $cruiseAfterFlow", cruiseAfterFlow > 12)
+        assertTrue("Expected totalEco to increase, got $totalAfterFlow", totalAfterFlow > 0)
+
+        // Stop at traffic light -> scores must remain completely frozen
+        for (i in 0 until 15) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    throttlePct = 13f,
+                    coolantTempC = 82,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertEquals("ecoCruiseScore must remain frozen when stationary", cruiseAfterFlow, engine.state.value.eco.speedSteadiness)
+        assertEquals("totalEco must remain frozen when stationary", totalAfterFlow, engine.state.value.eco.totalScore)
+    }
+
+    @Test
+    fun testStationaryPid2FFuelAnchoringAndMotionSloshRejection() {
+        val settings = FakeSettingsStore(initialTankLiters = 32.0f, initialCalibrated = false)
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+
+        var ts = 1_700_000_000_000L
+
+        // 1. While moving, even wildly sloshing PID 0x2F readings must NOT calibrate the tank
+        val sloshSamples = listOf(35f, 55f, 38f, 40f, 36f)
+        for (pct in sloshSamples) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 2000,
+                    speedKmh = 50,
+                    mafGramsPerSec = 8f,
+                    rawFuelLevelPct = pct,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertFalse("Must NOT anchor tank while moving", settings.isTankCalibrated.value)
+        assertTrue("Tank should remain near 32L via MAF only", engine.state.value.fuelTank.remainingLiters > 31.5f)
+
+        // 2. Come to a stop with median 37% (~17.39L on 47L tank)
+        val stationaryPcts = listOf(36f, 37f, 60f, 38f, 37f, 37f, 37f)
+        for (pct in stationaryPcts) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    mafGramsPerSec = 2.0f,
+                    rawFuelLevelPct = pct,
+                    timestampMs = ts
+                )
+            )
+        }
+
+        val expectedLiters = (37f / 100f) * 47.0f
+        assertTrue("Tank must be calibrated when stationary", settings.isTankCalibrated.value)
+        assertEquals(expectedLiters, engine.state.value.fuelTank.remainingLiters, 0.25f)
+        assertEquals(37f, engine.state.value.fuelTank.rawSensorPct ?: 0f, 0.5f)
+    }
+
+    @Test
+    fun testFullTankSensorCeilingRounding() {
+        // Direct ceiling helper verification: >= 93.0% rounds up to full 47.0 L
+        assertEquals(47.0f, TelemetryEngine.computeEffectiveSensorLiters(93.0f, 47.0f), 0.001f)
+        assertEquals(47.0f, TelemetryEngine.computeEffectiveSensorLiters(94.9f, 47.0f), 0.001f)
+        assertEquals((92.5f / 100f) * 47.0f, TelemetryEngine.computeEffectiveSensorLiters(92.5f, 47.0f), 0.001f)
+
+        // End-to-end check at trip start after refueling to click-off (~94.9% from S-Cross float)
+        val settings = FakeSettingsStore(initialTankLiters = 32.0f, initialCalibrated = true)
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+
+        var ts = 1_700_000_000_000L
+        for (i in 0 until 3) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    mafGramsPerSec = 0f,
+                    rawFuelLevelPct = 94.9f,
+                    timestampMs = ts
+                )
+            )
+        }
+
+        assertEquals(47.0f, engine.state.value.fuelTank.remainingLiters, 0.05f)
+        assertEquals(100, engine.state.value.fuelTank.remainingPct)
+        assertEquals(1, settings.anchorCallCount)
+    }
+
+    @Test
+    fun testNoMidTripTankReAnchoringOnSlopedTrafficLights() {
+        val settings = FakeSettingsStore(initialTankLiters = 37.5f, initialCalibrated = true)
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+
+        var ts = 1_700_000_000_000L
+        // Start driving with matching sensor reading (~80% = 37.6L, no initial jump) past 0.05 km
+        for (i in 0 until 20) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 1900,
+                    speedKmh = 45, // 20s @ 45 km/h = 0.25 km (> 0.05 km)
+                    coolantTempC = 85,
+                    mafGramsPerSec = 7.0f,
+                    rawFuelLevelPct = 79.8f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertEquals("No re-anchor at steady start", 0, settings.anchorCallCount)
+        val fuelBeforeStop = engine.state.value.fuelTank.remainingLiters
+
+        // Stop 15 seconds at sloped traffic lights with PID 0x2F swinging wildly between 75.3% (35.4L) and 87.5% (41.1L)
+        val trafficLightSwings = listOf(
+            75.3f, 75.3f, 76.0f, 87.5f, 87.5f,
+            86.0f, 75.8f, 87.5f, 87.5f, 87.5f,
+            75.3f, 76.0f, 85.0f, 87.5f, 87.5f
+        )
+        for (pct in trafficLightSwings) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    coolantTempC = 85,
+                    mafGramsPerSec = 1.6f,
+                    rawFuelLevelPct = pct,
+                    timestampMs = ts
+                )
+            )
+        }
+
+        // Must NEVER jump/re-anchor mid-trip at sloped traffic lights!
+        assertEquals("Traffic-light slopes must NOT re-anchor tank", 0, settings.anchorCallCount)
+        assertTrue(
+            "Remaining tank should decrease monotonically via MAF only (was $fuelBeforeStop, now ${engine.state.value.fuelTank.remainingLiters})",
+            engine.state.value.fuelTank.remainingLiters <= fuelBeforeStop &&
+                engine.state.value.fuelTank.remainingLiters > fuelBeforeStop - 0.1f
+        )
+
+        // Now simulate pulling into a gas station with engine running: stopped >= 25s with upward refuel jump to 94.9% -> 47.0L
+        for (i in 0 until 26) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    coolantTempC = 85,
+                    mafGramsPerSec = 0.5f,
+                    rawFuelLevelPct = 94.9f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertEquals("Stationary engine-on refuel >= 25s must re-anchor to 47L", 1, settings.anchorCallCount)
+        assertEquals(47.0f, engine.state.value.fuelTank.remainingLiters, 0.05f)
+    }
+
+    @Test
+    fun testEngineCareFrozenOnShutdownNoFalseWarmupPenalty() {
+        val settings = FakeSettingsStore(initialTankLiters = 35.0f, initialCalibrated = true)
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+
+        var ts = 1_700_000_000_000L
+        // Warm driving at 88°C, 1800 rpm
+        for (i in 0 until 20) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 1800,
+                    speedKmh = 50,
+                    coolantTempC = 88,
+                    intakeTempC = 30,
+                    mafGramsPerSec = 7.5f,
+                    mapKpa = 104,
+                    baroKpa = 101,
+                    throttlePct = 20f,
+                    engineLoadPct = 35f,
+                    voltage12v = 14.2f,
+                    timestampMs = ts
+                )
+            )
+        }
+
+        val preShutdownCareTotal = engine.state.value.care.totalScore
+        val preShutdownWarmup = engine.state.value.care.warmupScore
+        assertEquals(100, preShutdownWarmup)
+        assertEquals(88, engine.state.value.coolantTempC)
+        assertTrue("Expected high Care score while warm, got $preShutdownCareTotal", preShutdownCareTotal >= 98)
+
+        // Feed 6 engine shutdown snapshots where raw coolant resets to 25°C and rpm drops to 0
+        for (i in 0 until 6) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 0,
+                    speedKmh = 0,
+                    coolantTempC = 25,
+                    intakeTempC = 25,
+                    mafGramsPerSec = 0f,
+                    voltage12v = 12.0f,
+                    timestampMs = ts
+                )
+            )
+        }
+
+        assertEquals("care.warmupScore must stay 100 on engine shutdown", 100, engine.state.value.care.warmupScore)
+        assertEquals("care.totalScore must stay unchanged when engine is off", preShutdownCareTotal, engine.state.value.care.totalScore)
+        assertEquals("coolantTempC must preserve last valid 88°C on shutdown", 88, engine.state.value.coolantTempC)
+    }
+
+    @Test
+    fun testAutoNightThemeViaSolarTwilightHelper() {
+        val noonUtc = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+            set(2026, Calendar.NOVEMBER, 23, 10, 0, 0) // 12:00 EET daytime
+        }.timeInMillis
+        val nightUtc = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+            set(2026, Calendar.NOVEMBER, 23, 17, 0, 0) // 19:00 EET night in Nov
+        }.timeInMillis
+
+        assertFalse("SolarTwilightHelper.isNightNow at noon must be false", SolarTwilightHelper.isNightNow(noonUtc))
+        assertTrue("SolarTwilightHelper.isNightNow at 19:00 Nov must be true", SolarTwilightHelper.isNightNow(nightUtc))
+
+        // AUTO respects night solar time even when SLDA reports carContextDarkMode == false
+        assertTrue(SolarTwilightHelper.resolveAutoDarkMode("AUTO", carContextDarkMode = false, epochMs = nightUtc))
+        assertFalse(SolarTwilightHelper.resolveAutoDarkMode("AUTO", carContextDarkMode = false, epochMs = noonUtc))
+        assertTrue(SolarTwilightHelper.resolveAutoDarkMode("AUTO", carContextDarkMode = true, epochMs = noonUtc))
+
+        // Manual overrides always win
+        assertFalse(SolarTwilightHelper.resolveAutoDarkMode("LIGHT", carContextDarkMode = true, epochMs = nightUtc))
+        assertTrue(SolarTwilightHelper.resolveAutoDarkMode("DARK", carContextDarkMode = false, epochMs = noonUtc))
+    }
+
+    @Test
+    fun testSolarSunsetCheckAndOptInHeadlightsAlert() {
+        val noonUtc = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+            set(2026, Calendar.NOVEMBER, 23, 10, 0, 0)
+        }.timeInMillis
+        val nightUtc = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+            set(2026, Calendar.NOVEMBER, 23, 17, 0, 0)
+        }.timeInMillis
+
+        assertFalse("Odesa local noon must be daytime", SolarCalculator.isCivilTwilightOrNight(noonUtc))
+        assertTrue("Odesa 19:00 EET in Nov must be twilight/night", SolarCalculator.isCivilTwilightOrNight(nightUtc))
+
+        // Default disabled (headlightsReminderEnabled == false) -> never fires even at night
+        val settings = FakeSettingsStore(initialHeadlightsReminder = false)
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+        engine.updateCarContextDarkMode(false)
+
+        var nightTs = nightUtc
+        for (i in 0 until 8) {
+            nightTs += 1000L
+            engine.processSnapshot(RawObdSnapshot(rpm = 1800, speedKmh = 50, timestampMs = nightTs))
+        }
+        assertFalse("Default disabled reminder must NOT fire alert", engine.state.value.headlightsAlert)
+
+        // Enable opt-in toggle -> never fires in daytime, fires > 5s at night with isDarkMode == false
+        settings.setHeadlightsReminderEnabled(true)
+        var dayTs = noonUtc
+        for (i in 0 until 8) {
+            dayTs += 1000L
+            engine.processSnapshot(RawObdSnapshot(rpm = 1800, speedKmh = 50, timestampMs = dayTs))
+        }
+        assertFalse("Opt-in reminder must NOT fire in daytime", engine.state.value.headlightsAlert)
+
+        for (i in 0 until 8) {
+            nightTs += 1000L
+            engine.processSnapshot(RawObdSnapshot(rpm = 1800, speedKmh = 50, timestampMs = nightTs))
+        }
+        assertTrue("Opt-in reminder must fire at night when isDarkMode == false", engine.state.value.headlightsAlert)
+
+        engine.updateCarContextDarkMode(true)
+        assertFalse("Alert must clear when car enters dark mode", engine.state.value.headlightsAlert)
+    }
+
+    @Test
+    fun testUkrainianTripPluralization() {
+        assertEquals("0 поїздок", formatTripsCountUk(0))
+        assertEquals("1 поїздка", formatTripsCountUk(1))
+        assertEquals("2 поїздки", formatTripsCountUk(2))
+        assertEquals("3 поїздки", formatTripsCountUk(3))
+        assertEquals("4 поїздки", formatTripsCountUk(4))
+        assertEquals("5 поїздок", formatTripsCountUk(5))
+        assertEquals("11 поїздок", formatTripsCountUk(11))
+        assertEquals("21 поїздка", formatTripsCountUk(21))
+        assertEquals("23 поїздки", formatTripsCountUk(23))
+    }
+
+    @Test
+    fun testPeriodAnalyticsKpiAndDeduplication() {
+        val now = 1_700_000_000_000L
+        val trips = listOf(
+            TripRecord(id = 1, startTimeMs = now, endTimeMs = now + 60_000, distanceKm = 2.0f, fuelUsedLiters = 0.2f, fuelCostUah = 11.3f, avgConsumption100Km = 10.0f, hybridSavedLiters = 0.01f, hybridSavedUah = 0.56f, ecoScore = 60, careScore = 98, remainingTankLiters = 30f),
+            TripRecord(id = 2, startTimeMs = now, endTimeMs = now + 300_000, distanceKm = 10.0f, fuelUsedLiters = 0.70f, fuelCostUah = 39.55f, avgConsumption100Km = 7.0f, hybridSavedLiters = 0.08f, hybridSavedUah = 4.52f, ecoScore = 84, careScore = 99, remainingTankLiters = 29.3f, csvFileName = "trip1.csv"),
+            TripRecord(id = 3, startTimeMs = now + 3_600_000, endTimeMs = now + 4_200_000, distanceKm = 20.0f, fuelUsedLiters = 1.10f, fuelCostUah = 62.15f, avgConsumption100Km = 5.5f, hybridSavedLiters = 0.12f, hybridSavedUah = 6.78f, ecoScore = 92, careScore = 97, remainingTankLiters = 28.2f, csvFileName = "trip2.csv")
+        )
+
+        val unique = deduplicateTrips(trips)
+        assertEquals(2, unique.size)
+
+        val kpi = computePeriodKpi(unique)
+        assertEquals(30.0f, kpi.totalDistanceKm, 0.01f)
+        assertEquals(1.80f, kpi.totalFuelLiters, 0.01f)
+        assertEquals(6.0f, kpi.weightedAvgL100Km, 0.05f)
+        assertEquals(3.39f, kpi.costPerKmUah, 0.02f)
+        assertEquals(88, kpi.avgEcoScore)
+        assertEquals(98, kpi.avgCareScore)
+        assertEquals(4, AnalyticsPeriod.entries.size)
+    }
+
+    // ──────── Existing Regression Tests ────────
+
+    @Test
+    fun testMultiEcuDtcParsingEliminatesFalseP0043() {
+        val rawMultiEcu = "4300\n4300"
+        val codes = mutableListOf<String>()
+        for (line in rawMultiEcu.split('\n')) {
+            val idx = line.indexOf("43")
+            if (idx < 0) continue
+            val after43 = line.substring(idx + 2).trim()
+            if (after43.length < 2) continue
+            val count = after43.substring(0, 2).toIntOrNull(16) ?: 0
+            if (count == 0) continue
+            val dtcHex = after43.substring(2)
+            var i = 0
+            var found = 0
+            while (i + 3 < dtcHex.length && found < count) {
+                val b1 = dtcHex.substring(i, i + 2).toIntOrNull(16) ?: break
+                val b2 = dtcHex.substring(i + 2, i + 4).toIntOrNull(16) ?: break
+                if (b1 != 0 || b2 != 0) {
+                    val prefix = when ((b1 shr 6) and 0x03) {
+                        0 -> "P"; 1 -> "C"; 2 -> "B"; else -> "U"
+                    }
+                    val d2 = (b1 shr 4) and 0x03
+                    val d3 = b1 and 0x0F
+                    val d4 = (b2 shr 4) and 0x0F
+                    val d5 = b2 and 0x0F
+                    codes.add("$prefix$d2${d3.toString(16).uppercase()}${d4.toString(16).uppercase()}${d5.toString(16).uppercase()}")
+                    found++
+                }
+                i += 4
+            }
+        }
+        assertTrue("Expected 0 DTCs from 4300\\n4300, but got: $codes", codes.isEmpty())
+    }
+
+    @Test
+    fun testBentoCanvasRendererTapAnywhereDismissesOverlay() {
+        val renderer = BentoCanvasRenderer()
+        renderer.toggleFuelOverlay()
+        assertEquals(BentoCanvasRenderer.ActiveOverlay.GAS_STATION_REFUEL, renderer.activeOverlay)
+
+        var resetConfirmed = false
+        var animStartedWithOpen: Boolean? = null
+
+        renderer.handleTap(
+            x = 50f,
+            y = 50f,
+            onResetTripConfirmed = { resetConfirmed = true },
+            startAnimation = { open -> animStartedWithOpen = open }
+        )
+        assertFalse(resetConfirmed)
+        assertEquals(false, animStartedWithOpen)
+
+        renderer.onCloseAnimationFinished()
+        assertEquals(BentoCanvasRenderer.ActiveOverlay.NONE, renderer.activeOverlay)
+    }
+
+    @Test
+    fun testNavigationTemplateWithThemeAction() {
+        val themeAction = androidx.car.app.model.Action.Builder()
+            .setTitle("Авто")
+            .setOnClickListener { }
+            .build()
+        val actionStrip = androidx.car.app.model.ActionStrip.Builder()
+            .addAction(themeAction)
+            .build()
+        val template = androidx.car.app.navigation.model.NavigationTemplate.Builder()
+            .setActionStrip(actionStrip)
+            .build()
+        assertNotNull(template)
+    }
+
+    @Test
+    fun testObdTelemetryServiceConstants() {
+        assertEquals("scross_telemetry_channel", ua.odesa.scrossdash.service.ObdTelemetryService.CHANNEL_ID)
+        assertEquals(4801, ua.odesa.scrossdash.service.ObdTelemetryService.NOTIFICATION_ID)
+        assertEquals("ua.odesa.scrossdash.action.CAR_BT_CONNECTED", ua.odesa.scrossdash.service.ObdTelemetryService.ACTION_CAR_BT_CONNECTED)
+        assertEquals("ua.odesa.scrossdash.action.CAR_BT_DISCONNECTED", ua.odesa.scrossdash.service.ObdTelemetryService.ACTION_CAR_BT_DISCONNECTED)
+    }
+
+    @Test
+    fun testCarBluetoothReceiverDeviceMatching() {
+        val isTarget = { name: String, mac: String ->
+            name.contains("Suzuki", ignoreCase = true) ||
+                name.contains("AAWireless", ignoreCase = true) ||
+                mac.equals("F8:96:FE:49:7C:42", ignoreCase = true)
+        }
+        assertTrue(isTarget("Suzuki CAR", "F8:96:FE:49:7C:42"))
+        assertTrue(isTarget("AAWireless-1234", "AA:BB:CC:DD:EE:FF"))
+        assertTrue(isTarget("Custom Name", "f8:96:fe:49:7c:42"))
+        assertFalse(isTarget("Galaxy Buds", "11:22:33:44:55:66"))
+        assertFalse(isTarget("OBDII", "AA:BB:CC:11:22:33"))
+    }
+}

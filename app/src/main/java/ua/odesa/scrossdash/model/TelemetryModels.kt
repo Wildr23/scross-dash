@@ -90,5 +90,6 @@ data class AppSettings(
     val tankCapacityLiters: Float = 47.0f,
     val demoMode: Boolean = false,
     val themeMode: String = "AUTO", // "AUTO", "LIGHT", "DARK"
-    val headlightsReminderEnabled: Boolean = false
+    val headlightsReminderEnabled: Boolean = false,
+    val odometerKm: Float = 0f
 )

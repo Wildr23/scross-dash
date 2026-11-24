@@ -15,9 +15,10 @@ interface TripStore {
     suspend fun getLatestTrip(): TripRecord?
 }
 
-class TripRepository(context: Context) : TripStore {
+class TripRepository(private val dbHelper: TripDatabaseHelper) : TripStore {
 
-    private val dbHelper = TripDatabaseHelper(context)
+    constructor(context: Context) : this(TripDatabaseHelper(context))
+
     private val scope = CoroutineScope(Dispatchers.IO)
 
     private val _trips = MutableStateFlow<List<TripRecord>>(emptyList())

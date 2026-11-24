@@ -14,6 +14,8 @@ interface SettingsStore {
     fun saveRemainingTankLiters(liters: Float)
     fun anchorTankToSensor(liters: Float)
     fun markRefueledToFull()
+    fun updateOdometerKm(odometerKm: Float)
+    fun incrementOdometerKm(deltaKm: Float)
 }
 
 class SettingsRepository(context: Context) : SettingsStore {
@@ -55,7 +57,8 @@ class SettingsRepository(context: Context) : SettingsStore {
             tankCapacityLiters = prefs.getFloat("tank_capacity_liters", 47.0f),
             demoMode = prefs.getBoolean("demo_mode", false),
             themeMode = prefs.getString("theme_mode", "AUTO") ?: "AUTO",
-            headlightsReminderEnabled = prefs.getBoolean("headlights_reminder_enabled", false)
+            headlightsReminderEnabled = prefs.getBoolean("headlights_reminder_enabled", false),
+            odometerKm = prefs.getFloat("odometer_km", 0f).coerceAtLeast(0f)
         )
     }
 
@@ -124,5 +127,20 @@ class SettingsRepository(context: Context) : SettingsStore {
     override fun markRefueledToFull() {
         val fullCapacity = _settings.value.tankCapacityLiters
         anchorTankToSensor(fullCapacity)
+    }
+
+    @Synchronized
+    override fun updateOdometerKm(odometerKm: Float) {
+        val safeKm = odometerKm.coerceAtLeast(0f)
+        prefs.edit().putFloat("odometer_km", safeKm).apply()
+        _settings.value = _settings.value.copy(odometerKm = safeKm)
+    }
+
+    @Synchronized
+    override fun incrementOdometerKm(deltaKm: Float) {
+        if (deltaKm <= 0f) return
+        val updated = (_settings.value.odometerKm + deltaKm).coerceAtLeast(0f)
+        prefs.edit().putFloat("odometer_km", updated).apply()
+        _settings.value = _settings.value.copy(odometerKm = updated)
     }
 }

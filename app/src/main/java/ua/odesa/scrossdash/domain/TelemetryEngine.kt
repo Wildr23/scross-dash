@@ -11,6 +11,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import ua.odesa.scrossdash.data.SettingsStore
+import ua.odesa.scrossdash.data.db.AutoRefuelEvent
+import ua.odesa.scrossdash.data.db.ExpenseStore
 import ua.odesa.scrossdash.data.db.TripRecord
 import ua.odesa.scrossdash.data.db.TripStore
 import ua.odesa.scrossdash.data.log.CsvLogSink
@@ -24,6 +26,8 @@ class TelemetryEngine(
     private val tripRepo: TripStore? = null,
     private val csvLogger: CsvLogSink? = null,
     private val onTripFinalized: ((TripRecord) -> Unit)? = null,
+    private val expenseStore: ExpenseStore? = null,
+    private val onAutoRefuelDetected: ((AutoRefuelEvent) -> Unit)? = null,
     private val solarDarknessProvider: (Long) -> Boolean = { SolarTwilightHelper.isNightNow(it) },
     persistenceDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
@@ -73,9 +77,11 @@ class TelemetryEngine(
     private var tripFuelBurnedLiters = 0f
     private var hybridSavedLiters = 0f
 
-    // Auto-save, Tank stabilization & Ignition-off detection
+    // Auto-save, Tank stabilization, Odometer & Ignition-off detection
     private var lastAutoSaveTimeMs = 0L
     private var persistedFuelCounterLiters = 0f
+    private var pendingOdometerDeltaKm = 0f
+    private var lastAutoRefuelEmitMs = Long.MIN_VALUE
     private var stationarySec = 0f
     private var ecuSleepSec = 0f
     private var ignitionOffLowVoltSec = 0f
@@ -186,6 +192,7 @@ class TelemetryEngine(
         tripFuelBurnedLiters = 0f
         hybridSavedLiters = 0f
         lastAutoSaveTimeMs = 0L
+        pendingOdometerDeltaKm = 0f
         ecuSleepSec = 0f
         ignitionOffLowVoltSec = 0f
         tripStartTankAnchorChecked = false
@@ -231,6 +238,13 @@ class TelemetryEngine(
         postSummaryNotification: Boolean = true,
         reason: String = "IGNITION_OFF"
     ) {
+        if (!_state.value.isDemoMode && pendingOdometerDeltaKm >= 0.01f) {
+            val remainingDelta = pendingOdometerDeltaKm
+            pendingOdometerDeltaKm = 0f
+            settingsRepo.incrementOdometerKm(remainingDelta)
+            expenseStore?.addDistanceToMountedTire(remainingDelta)
+        }
+
         if (!isTripActive && tripDistanceKm < 0.2f) {
             if (activeCsvFileName != null) {
                 csvLogger?.closeSession()
@@ -466,6 +480,15 @@ class TelemetryEngine(
         if (isTripActive) {
             tripDistanceKm += deltaKm
             tripFuelBurnedLiters += deltaFuelLiters
+            if (!_state.value.isDemoMode && deltaKm > 0f) {
+                pendingOdometerDeltaKm += deltaKm
+                if (pendingOdometerDeltaKm >= 0.5f) {
+                    val flushed = pendingOdometerDeltaKm
+                    pendingOdometerDeltaKm = 0f
+                    settingsRepo.incrementOdometerKm(flushed)
+                    expenseStore?.addDistanceToMountedTire(flushed)
+                }
+            }
         }
 
         // 2. 48V Mild Hybrid (ISG) Mode & Monotonic Savings Accumulation
@@ -522,6 +545,7 @@ class TelemetryEngine(
             val effectiveSensorLiters = computeEffectiveSensorLiters(medPctNow, settings.tankCapacityLiters)
             val sensorDelta = effectiveSensorLiters - inMemoryRemainingLiters
             val isCalibrated = settingsRepo.isTankCalibrated.value
+            val prevTankLiters = inMemoryRemainingLiters
 
             when {
                 // 1. Initial connection when tank was never calibrated yet (stationary to avoid motion slosh)
@@ -545,6 +569,9 @@ class TelemetryEngine(
                             settingsRepo.anchorTankToSensor(inMemoryRemainingLiters)
                         }
                         csvLogger?.logEvent("TANK_ANCHORED_START:${String.format(Locale.US, "%.1f", inMemoryRemainingLiters)}L")
+                        if (sensorDelta > 5.0f) {
+                            emitAutoRefuelIfEligible(prevTankLiters, inMemoryRemainingLiters, medPctNow, "TRIP_START", now)
+                        }
                     }
                 }
 
@@ -557,6 +584,7 @@ class TelemetryEngine(
                         settingsRepo.anchorTankToSensor(inMemoryRemainingLiters)
                     }
                     csvLogger?.logEvent("TANK_REFUEL_ENGINE_ON:${String.format(Locale.US, "%.1f", inMemoryRemainingLiters)}L")
+                    emitAutoRefuelIfEligible(prevTankLiters, inMemoryRemainingLiters, medPctNow, "ENGINE_ON", now)
                 }
             }
         }
@@ -837,6 +865,39 @@ class TelemetryEngine(
             rawSensorLiters = sensorLiters,
             isTankCalibrated = settingsRepo.isTankCalibrated.value
         )
+    }
+
+    private fun emitAutoRefuelIfEligible(
+        prevTank: Float,
+        newTank: Float,
+        medPct: Float,
+        source: String,
+        now: Long
+    ) {
+        if (_state.value.isDemoMode) return
+        val added = ((newTank - prevTank) * 10f).roundToInt() / 10f
+        if (added < 5.0f) return
+        if (lastAutoRefuelEmitMs != Long.MIN_VALUE && abs(now - lastAutoRefuelEmitMs) < 600_000L) {
+            return
+        }
+
+        val settings = settingsRepo.settings.value
+        val event = AutoRefuelEvent(
+            timestampMs = now,
+            addedLiters = added,
+            newTankLiters = newTank,
+            pricePerLiterUah = settings.fuelPriceUah,
+            estimatedCostUah = (added * settings.fuelPriceUah).roundToInt().toFloat(),
+            isFullTank = medPct >= FULL_TANK_SENSOR_CEILING_PCT,
+            odometerKm = settings.odometerKm,
+            source = source
+        )
+        val saved = expenseStore?.recordAutoRefuel(event)
+        if (expenseStore == null || saved != null) {
+            lastAutoRefuelEmitMs = now
+            csvLogger?.logEvent("AUTO_REFUEL_EXPENSE:+${String.format(Locale.US, "%.1f", added)}L")
+            onAutoRefuelDetected?.invoke(event)
+        }
     }
 
     private fun computeMedian(samples: Collection<Float>): Float {

@@ -7,8 +7,7 @@ import org.junit.Assert.*
 import org.junit.Test
 import ua.odesa.scrossdash.auto.BentoCanvasRenderer
 import ua.odesa.scrossdash.data.SettingsStore
-import ua.odesa.scrossdash.data.db.TripRecord
-import ua.odesa.scrossdash.data.db.TripStore
+import ua.odesa.scrossdash.data.db.*
 import ua.odesa.scrossdash.data.log.CsvLogSink
 import ua.odesa.scrossdash.domain.SolarCalculator
 import ua.odesa.scrossdash.domain.SolarTwilightHelper
@@ -29,14 +28,16 @@ class VerificationTest {
     private class FakeSettingsStore(
         initialTankLiters: Float = 32.0f,
         initialCalibrated: Boolean = false,
-        initialHeadlightsReminder: Boolean = false
+        initialHeadlightsReminder: Boolean = false,
+        initialOdometerKm: Float = 0f
     ) : SettingsStore {
         private val _settings = MutableStateFlow(
             AppSettings(
                 fuelPriceUah = 56.50f,
                 mafCalibration = 1.00f,
                 tankCapacityLiters = 47.0f,
-                headlightsReminderEnabled = initialHeadlightsReminder
+                headlightsReminderEnabled = initialHeadlightsReminder,
+                odometerKm = initialOdometerKm
             )
         )
         override val settings: StateFlow<AppSettings> = _settings
@@ -53,6 +54,10 @@ class VerificationTest {
             _settings.value = _settings.value.copy(headlightsReminderEnabled = enabled)
         }
 
+        fun setDemoMode(enabled: Boolean) {
+            _settings.value = _settings.value.copy(demoMode = enabled)
+        }
+
         override fun saveRemainingTankLiters(liters: Float) {
             _calibratedTankLiters.value = liters.coerceIn(0f, _settings.value.tankCapacityLiters)
         }
@@ -65,6 +70,63 @@ class VerificationTest {
 
         override fun markRefueledToFull() {
             anchorTankToSensor(_settings.value.tankCapacityLiters)
+        }
+
+        override fun updateOdometerKm(odometerKm: Float) {
+            _settings.value = _settings.value.copy(odometerKm = odometerKm.coerceAtLeast(0f))
+        }
+
+        override fun incrementOdometerKm(deltaKm: Float) {
+            if (deltaKm <= 0f) return
+            _settings.value = _settings.value.copy(odometerKm = _settings.value.odometerKm + deltaKm)
+        }
+    }
+
+    private class FakeExpenseStore : ExpenseStore {
+        private var nextId = 1L
+        private val expenseList = mutableListOf<ExpenseRecord>()
+        private val _expenses = MutableStateFlow<List<ExpenseRecord>>(emptyList())
+        override val expenses: StateFlow<List<ExpenseRecord>> = _expenses
+
+        private val consumableList = defaultSCrossConsumables(isWinterSeason = true)
+            .mapIndexed { idx, item -> item.copy(id = idx + 1L) }
+            .toMutableList()
+        private val _consumables = MutableStateFlow<List<ConsumableItem>>(consumableList.toList())
+        override val consumables: StateFlow<List<ConsumableItem>> = _consumables
+
+        private var lastAutoRefuelMs: Long = Long.MIN_VALUE
+
+        override fun recordAutoRefuel(event: AutoRefuelEvent): ExpenseRecord? {
+            if (lastAutoRefuelMs != Long.MIN_VALUE && kotlin.math.abs(event.timestampMs - lastAutoRefuelMs) < ExpenseRepository.AUTO_REFUEL_DEBOUNCE_MS) {
+                return null
+            }
+            lastAutoRefuelMs = event.timestampMs
+            val saved = ExpenseRecord(
+                id = nextId++,
+                timestampMs = event.timestampMs,
+                category = ExpenseCategory.FUEL,
+                title = if (event.isFullTank) "Авто-заправка (повний бак)" else "Авто-заправка",
+                amountUah = event.estimatedCostUah,
+                odometerKm = event.odometerKm,
+                liters = event.addedLiters,
+                pricePerLiter = event.pricePerLiterUah,
+                isFullTank = event.isFullTank,
+                isAutoDetected = true,
+                note = "Автоматично зафіксовано (PID 0x2F)"
+            )
+            expenseList.add(0, saved)
+            _expenses.value = expenseList.toList()
+            return saved
+        }
+
+        override fun addDistanceToMountedTire(deltaKm: Float) {
+            if (deltaKm <= 0f) return
+            for (i in consumableList.indices) {
+                if (consumableList[i].isTireSet && consumableList[i].isMounted) {
+                    consumableList[i] = consumableList[i].copy(accumulatedKm = consumableList[i].accumulatedKm + deltaKm)
+                }
+            }
+            _consumables.value = consumableList.toList()
         }
     }
 
@@ -689,5 +751,359 @@ class VerificationTest {
         assertTrue(isTarget("Custom Name", "f8:96:fe:49:7c:42"))
         assertFalse(isTarget("Galaxy Buds", "11:22:33:44:55:66"))
         assertFalse(isTarget("OBDII", "AA:BB:CC:11:22:33"))
+    }
+
+    // ──────── Expenses, Maintenance & Odometer Tests ────────
+
+    @Test
+    fun testZeroTouchAutoRefuelDetectionAndDebounce() {
+        val settings = FakeSettingsStore(
+            initialTankLiters = 32.0f,
+            initialCalibrated = false,
+            initialOdometerKm = 14_250f
+        )
+        val expenseStore = FakeExpenseStore()
+        val emittedEvents = mutableListOf<AutoRefuelEvent>()
+
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            expenseStore = expenseStore,
+            onAutoRefuelDetected = { emittedEvents.add(it) },
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+        engine.updateConnectionStatus(connected = true, demo = false, message = "Connected")
+
+        var ts = 1_700_000_000_000L
+        // 1. Initial uncalibrated anchor (~25 L) MUST NOT create an auto-refuel expense
+        engine.processSnapshot(
+            RawObdSnapshot(
+                rpm = 750,
+                speedKmh = 0,
+                coolantTempC = 85,
+                voltage12v = 14.1f,
+                rawFuelLevelPct = 53.2f,
+                timestampMs = ts
+            )
+        )
+        assertTrue(settings.isTankCalibrated.value)
+        assertEquals(0, expenseStore.expenses.value.size)
+        assertEquals(0, emittedEvents.size)
+
+        // 2. Next ignition/trip start after filling to nozzle click (>= 93% -> 47.0 L) emits full-tank expense
+        engine.resetTrip()
+        ts += 60_000L
+        engine.processSnapshot(
+            RawObdSnapshot(
+                rpm = 750,
+                speedKmh = 0,
+                coolantTempC = 82,
+                voltage12v = 14.1f,
+                rawFuelLevelPct = 94.9f,
+                timestampMs = ts
+            )
+        )
+        assertEquals(1, expenseStore.expenses.value.size)
+        assertEquals(1, emittedEvents.size)
+        assertTrue(emittedEvents[0].isFullTank)
+        assertTrue(emittedEvents[0].addedLiters > 20f)
+        assertEquals(14_250f, expenseStore.expenses.value[0].odometerKm, 0.1f)
+        assertTrue(expenseStore.expenses.value[0].isAutoDetected)
+
+        // 3. Downward slosh / drop must NOT emit expense, and upward jump inside 10 min must be debounced
+        engine.resetTrip()
+        ts += 60_000L
+        engine.processSnapshot(
+            RawObdSnapshot(
+                rpm = 750,
+                speedKmh = 0,
+                coolantTempC = 85,
+                voltage12v = 14.1f,
+                rawFuelLevelPct = 60.0f, // anchors down to ~28.2 L
+                timestampMs = ts
+            )
+        )
+        assertEquals(1, expenseStore.expenses.value.size)
+
+        engine.resetTrip()
+        ts += 60_000L // only 2 min after first auto-refuel (< 10 min debounce)
+        engine.processSnapshot(
+            RawObdSnapshot(
+                rpm = 750,
+                speedKmh = 0,
+                coolantTempC = 85,
+                voltage12v = 14.1f,
+                rawFuelLevelPct = 94.9f,
+                timestampMs = ts
+            )
+        )
+        assertEquals("Jump inside 10-minute debounce must be ignored", 1, expenseStore.expenses.value.size)
+
+        // 4. After > 10 minutes, stationary engine-on refuel emits a second expense
+        engine.resetTrip()
+        ts += 700_000L // > 11 minutes later
+        engine.processSnapshot(
+            RawObdSnapshot(
+                rpm = 750,
+                speedKmh = 0,
+                coolantTempC = 85,
+                voltage12v = 14.1f,
+                rawFuelLevelPct = 60.0f, // ~28.2 L
+                timestampMs = ts
+            )
+        )
+        // Drive briefly so tripStartTankAnchorChecked becomes true
+        ts += 2000L
+        engine.processSnapshot(
+            RawObdSnapshot(
+                rpm = 1800,
+                speedKmh = 30,
+                coolantTempC = 86,
+                voltage12v = 14.2f,
+                rawFuelLevelPct = 60.0f,
+                timestampMs = ts
+            )
+        )
+        // Now stop with engine running >= 25 seconds after filling up to 94.9%
+        for (i in 0 until 15) {
+            ts += 2500L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    coolantTempC = 86,
+                    voltage12v = 14.1f,
+                    rawFuelLevelPct = 94.9f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertEquals(2, expenseStore.expenses.value.size)
+        assertEquals(2, emittedEvents.size)
+
+        // 5. Demo mode must never emit expenses
+        settings.setDemoMode(true)
+        engine.updateConnectionStatus(connected = true, demo = true, message = "Demo")
+        engine.resetTrip()
+        ts += 700_000L
+        engine.processSnapshot(RawObdSnapshot(rpm = 750, speedKmh = 0, rawFuelLevelPct = 50.0f, timestampMs = ts))
+        engine.resetTrip()
+        ts += 5_000L
+        engine.processSnapshot(RawObdSnapshot(rpm = 750, speedKmh = 0, rawFuelLevelPct = 94.9f, timestampMs = ts))
+        assertEquals(2, expenseStore.expenses.value.size)
+    }
+
+    @Test
+    fun testOdometerAndMountedTireMileageAccumulation() {
+        val settings = FakeSettingsStore(
+            initialTankLiters = 35f,
+            initialCalibrated = true,
+            initialOdometerKm = 10_000f
+        )
+        val expenseStore = FakeExpenseStore()
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            expenseStore = expenseStore,
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+        engine.updateConnectionStatus(connected = true, demo = false, message = "Connected")
+
+        var ts = 1_700_000_000_000L
+        // 30 snapshots at 2s intervals at 72 km/h -> 60s = 1.2 km
+        for (i in 0..30) {
+            ts += 2000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 2000,
+                    speedKmh = 72,
+                    coolantTempC = 88,
+                    mafGramsPerSec = 9.0f,
+                    throttlePct = 24f,
+                    voltage12v = 14.2f,
+                    timestampMs = ts
+                )
+            )
+        }
+        engine.finalizeAndArchiveTrip(postSummaryNotification = false)
+
+        assertTrue("Odometer should advance ~1.2 km, was ${settings.settings.value.odometerKm}", settings.settings.value.odometerKm > 10_001.1f)
+        val mountedAfterReal = expenseStore.consumables.value.first { it.isTireSet && it.isMounted }
+        val storedAfterReal = expenseStore.consumables.value.first { it.isTireSet && !it.isMounted }
+        assertTrue("Mounted tire should accumulate km", mountedAfterReal.accumulatedKm > 1.1f)
+        assertEquals("Stored tire set must stay at 0 km", 0f, storedAfterReal.accumulatedKm, 0.001f)
+
+        // Demo mode must NOT pollute odometer or tire mileage
+        val odoBeforeDemo = settings.settings.value.odometerKm
+        val tireBeforeDemo = mountedAfterReal.accumulatedKm
+        settings.setDemoMode(true)
+        engine.updateConnectionStatus(connected = true, demo = true, message = "Demo")
+        for (i in 0..20) {
+            ts += 2000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 2200,
+                    speedKmh = 80,
+                    coolantTempC = 88,
+                    mafGramsPerSec = 10f,
+                    voltage12v = 14.2f,
+                    timestampMs = ts
+                )
+            )
+        }
+        engine.finalizeAndArchiveTrip(postSummaryNotification = false)
+
+        assertEquals(odoBeforeDemo, settings.settings.value.odometerKm, 0.001f)
+        val mountedAfterDemo = expenseStore.consumables.value.first { it.isTireSet && it.isMounted }
+        assertEquals(tireBeforeDemo, mountedAfterDemo.accumulatedKm, 0.001f)
+    }
+
+    @Test
+    fun testConsumableStatusAndTireRemainingLife() {
+        val now = 1_700_000_000_000L
+        val tireOk = ConsumableItem(
+            name = "Зимовий комплект",
+            category = ExpenseCategory.TIRES,
+            intervalKm = 45_000,
+            intervalMonths = 72,
+            lastDoneTimeMs = now,
+            accumulatedKm = 10_000f,
+            isTireSet = true,
+            tireSeason = TireSeason.WINTER,
+            isMounted = true
+        )
+        val statusOk = computeConsumableStatus(tireOk, currentOdometerKm = 25_000f, nowMs = now)
+        assertEquals(ConsumableUrgency.OK, statusOk.urgency)
+        assertEquals(35_000f, statusOk.remainingKm!!, 0.1f)
+
+        val tireSoon = tireOk.copy(accumulatedKm = 41_000f)
+        assertEquals(ConsumableUrgency.SOON, computeConsumableStatus(tireSoon, 60_000f, now).urgency)
+
+        val tireOverdue = tireOk.copy(accumulatedKm = 46_000f)
+        assertEquals(ConsumableUrgency.OVERDUE, computeConsumableStatus(tireOverdue, 65_000f, now).urgency)
+
+        // Regular consumable: UNCONFIGURED when lastDoneTimeMs == 0L
+        val oilUnconf = ConsumableItem(
+            name = "Моторна олива",
+            category = ExpenseCategory.MAINTENANCE,
+            intervalKm = 10_000,
+            intervalMonths = 12,
+            lastDoneTimeMs = 0L
+        )
+        assertEquals(ConsumableUrgency.UNCONFIGURED, computeConsumableStatus(oilUnconf, 15_000f, now).urgency)
+
+        // Regular consumable SOON and OVERDUE by km
+        val oilDone = oilUnconf.copy(lastDoneKm = 10_000f, lastDoneTimeMs = now)
+        assertEquals(ConsumableUrgency.OK, computeConsumableStatus(oilDone, 14_000f, now).urgency)
+        assertEquals(ConsumableUrgency.SOON, computeConsumableStatus(oilDone, 19_000f, now).urgency)
+        assertEquals(ConsumableUrgency.OVERDUE, computeConsumableStatus(oilDone, 20_500f, now).urgency)
+
+        // Time-based insurance countdown
+        val policy = ConsumableItem(
+            name = "ОСЦПВ",
+            category = ExpenseCategory.INSURANCE,
+            intervalKm = null,
+            intervalMonths = 12,
+            lastDoneTimeMs = now
+        )
+        val plus345Days = now + 345L * 86_400_000L
+        val plus380Days = now + 380L * 86_400_000L
+        assertEquals(ConsumableUrgency.SOON, computeConsumableStatus(policy, 10_000f, plus345Days).urgency)
+        assertEquals(ConsumableUrgency.OVERDUE, computeConsumableStatus(policy, 10_000f, plus380Days).urgency)
+    }
+
+    @Test
+    fun testTcoExpenseSummaryFullToFullAndCsvExport() {
+        val now = 1_700_000_000_000L
+        val dayMs = 86_400_000L
+        val expenses = listOf(
+            ExpenseRecord(
+                id = 1L,
+                timestampMs = now - 5L * dayMs,
+                category = ExpenseCategory.FUEL,
+                title = "АЗС OKKO, Київ",
+                amountUah = 2000f,
+                odometerKm = 10_500f,
+                liters = 35.0f,
+                pricePerLiter = 57.14f,
+                isFullTank = true,
+                note = "Повний \"до відстрілу\""
+            ),
+            ExpenseRecord(
+                id = 2L,
+                timestampMs = now - 12L * dayMs,
+                category = ExpenseCategory.WASH,
+                title = "Мийка + поліровка",
+                amountUah = 600f,
+                odometerKm = 10_200f
+            ),
+            ExpenseRecord(
+                id = 3L,
+                timestampMs = now - 45L * dayMs,
+                category = ExpenseCategory.FUEL,
+                title = "Попередній повний бак",
+                amountUah = 1800f,
+                odometerKm = 10_000f,
+                liters = 32.0f,
+                pricePerLiter = 56.25f,
+                isFullTank = true
+            )
+        )
+        val trips = listOf(
+            TripRecord(
+                id = 1L,
+                startTimeMs = now - 10L * dayMs,
+                endTimeMs = now - 10L * dayMs + 3600_000L,
+                distanceKm = 200f,
+                fuelUsedLiters = 14f,
+                fuelCostUah = 800f,
+                avgConsumption100Km = 7.0f,
+                hybridSavedLiters = 1f,
+                hybridSavedUah = 56f,
+                ecoScore = 80,
+                careScore = 95,
+                remainingTankLiters = 30f
+            ),
+            TripRecord(
+                id = 2L,
+                startTimeMs = now - 40L * dayMs,
+                endTimeMs = now - 40L * dayMs + 3600_000L,
+                distanceKm = 300f,
+                fuelUsedLiters = 21f,
+                fuelCostUah = 1200f,
+                avgConsumption100Km = 7.0f,
+                hybridSavedLiters = 1f,
+                hybridSavedUah = 56f,
+                ecoScore = 82,
+                careScore = 96,
+                remainingTankLiters = 28f
+            )
+        )
+
+        val monthSummary = computeExpenseSummary(expenses, trips, ExpensePeriod.MONTH, now)
+        assertEquals(2600f, monthSummary.totalSpendUah, 0.1f)
+        assertEquals(2000f, monthSummary.fuelSpendUah, 0.1f)
+        assertEquals(200f, monthSummary.totalDistanceKm, 0.1f)
+        assertEquals(13.0f, monthSummary.totalCostPerKmUah!!, 0.05f)
+        assertEquals(10.0f, monthSummary.fuelCostPerKmUah!!, 0.05f)
+
+        val yearSummary = computeExpenseSummary(expenses, trips, ExpensePeriod.YEAR, now)
+        assertEquals(4400f, yearSummary.totalSpendUah, 0.1f)
+        assertEquals(500f, yearSummary.totalDistanceKm, 0.1f)
+
+        val fullToFull = computeFullToFullConsumption(expenses)
+        assertNotNull(fullToFull)
+        assertEquals(7.0f, fullToFull!!, 0.05f) // 35.0 L / 500 km * 100
+
+        assertEquals("1 запис", formatExpensesCountUk(1))
+        assertEquals("2 записи", formatExpensesCountUk(2))
+        assertEquals("5 записів", formatExpensesCountUk(5))
+
+        val csv = buildExpensesCsv(expenses)
+        assertTrue(csv.contains("\"АЗС OKKO, Київ\""))
+        assertTrue(csv.contains("\"Повний \"\"до відстрілу\"\"\""))
+
+        val consumablesCsv = buildConsumablesCsv(defaultSCrossConsumables(), 10_500f)
+        assertTrue(consumablesCsv.contains("Моторна олива + фільтр (K14D)"))
     }
 }

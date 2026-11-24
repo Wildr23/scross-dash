@@ -1,6 +1,7 @@
 package ua.odesa.scrossdash
 
 import android.Manifest
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -10,6 +11,8 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 import ua.odesa.scrossdash.service.TripNotificationHelper
@@ -17,6 +20,9 @@ import ua.odesa.scrossdash.ui.PhoneDashboardScreen
 import ua.odesa.scrossdash.ui.SCrossTheme
 
 class MainActivity : ComponentActivity() {
+
+    private var selectedInitialTab by mutableIntStateOf(0)
+    private var tabTriggerKey by mutableIntStateOf(0)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -34,13 +40,15 @@ class MainActivity : ComponentActivity() {
         app.obdManager.refreshPairedDevices()
         app.obdManager.start()
 
-        val initialTab = intent?.getIntExtra(TripNotificationHelper.EXTRA_INITIAL_TAB, 0) ?: 0
+        selectedInitialTab = intent?.getIntExtra(TripNotificationHelper.EXTRA_INITIAL_TAB, 0) ?: 0
 
         setContent {
             val dashState by app.telemetryEngine.state.collectAsState()
             val settings by app.settingsRepository.settings.collectAsState()
             val pairedDevices by app.obdManager.pairedDevices.collectAsState()
             val trips by app.tripRepository.trips.collectAsState()
+            val expenses by app.expenseRepository.expenses.collectAsState()
+            val consumables by app.expenseRepository.consumables.collectAsState()
             val csvStats by app.csvLogger.stats.collectAsState()
 
             val systemDark = isSystemInDarkTheme()
@@ -65,8 +73,11 @@ class MainActivity : ComponentActivity() {
                     settings = settings,
                     pairedDevices = pairedDevices,
                     trips = trips,
+                    expenses = expenses,
+                    consumables = consumables,
                     csvStats = csvStats,
-                    initialTab = initialTab,
+                    initialTab = selectedInitialTab,
+                    tabTriggerKey = tabTriggerKey,
                     csvFileExists = { name -> app.csvLogger.logFileExists(name) },
                     onSelectDevice = { mac, name ->
                         app.settingsRepository.updateDevice(mac, name)
@@ -96,9 +107,34 @@ class MainActivity : ComponentActivity() {
                     onHeadlightsReminderChanged = { enabled ->
                         app.settingsRepository.setHeadlightsReminderEnabled(enabled)
                         if (!enabled) app.telemetryEngine.dismissHeadlightsAlert()
+                    },
+                    onUpdateOdometer = { app.settingsRepository.updateOdometerKm(it) },
+                    onAddExpense = { record, linkedConsId ->
+                        app.expenseRepository.addExpense(record, linkedConsId)
+                    },
+                    onUpdateExpense = { app.expenseRepository.updateExpense(it) },
+                    onDeleteExpense = { app.expenseRepository.deleteExpense(it) },
+                    onAddConsumable = { app.expenseRepository.addConsumable(it) },
+                    onUpdateConsumable = { app.expenseRepository.updateConsumable(it) },
+                    onDeleteConsumable = { app.expenseRepository.deleteConsumable(it) },
+                    onSwitchTireSet = { targetId, swapCost, odoKm, note ->
+                        app.expenseRepository.switchMountedTireSet(targetId, swapCost, odoKm, note)
+                    },
+                    onMarkConsumableServiced = { item, odoKm, costUah, note, resetTireKm ->
+                        app.expenseRepository.markConsumableServiced(item, odoKm, costUah, note, resetTireKm)
                     }
                 )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val requestedTab = intent.getIntExtra(TripNotificationHelper.EXTRA_INITIAL_TAB, -1)
+        if (requestedTab in 0..2) {
+            selectedInitialTab = requestedTab
+            tabTriggerKey++
         }
     }
 
@@ -107,6 +143,7 @@ class MainActivity : ComponentActivity() {
         val app = application as SCrossApplication
         app.obdManager.refreshPairedDevices()
         app.tripRepository.reloadTrips()
+        app.expenseRepository.reloadAll()
     }
 
     private fun requestRuntimePermissions() {

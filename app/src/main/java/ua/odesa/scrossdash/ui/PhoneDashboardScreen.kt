@@ -16,6 +16,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AccountBalanceWallet
 import androidx.compose.material.icons.rounded.BarChart
 import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material3.*
@@ -33,6 +34,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import ua.odesa.scrossdash.data.db.ConsumableItem
+import ua.odesa.scrossdash.data.db.ExpenseRecord
 import ua.odesa.scrossdash.data.db.TripRecord
 import ua.odesa.scrossdash.data.log.CsvLogStats
 import ua.odesa.scrossdash.model.AppSettings
@@ -47,8 +50,11 @@ fun PhoneDashboardScreen(
     settings: AppSettings,
     pairedDevices: List<BluetoothDevice>,
     trips: List<TripRecord> = emptyList(),
+    expenses: List<ExpenseRecord> = emptyList(),
+    consumables: List<ConsumableItem> = emptyList(),
     csvStats: CsvLogStats = CsvLogStats(),
     initialTab: Int = 0,
+    tabTriggerKey: Int = 0,
     csvFileExists: (String?) -> Boolean = { false },
     onSelectDevice: (String, String) -> Unit,
     onToggleDemo: (Boolean) -> Unit,
@@ -67,10 +73,21 @@ fun PhoneDashboardScreen(
     onClearCsvLogs: () -> Unit = {},
     onDismissHeadlightsAlert: () -> Unit = {},
     onThemeModeChanged: (String) -> Unit = {},
-    onHeadlightsReminderChanged: (Boolean) -> Unit = {}
+    onHeadlightsReminderChanged: (Boolean) -> Unit = {},
+    onUpdateOdometer: (Float) -> Unit = {},
+    onAddExpense: (ExpenseRecord, Long?) -> Unit = { _, _ -> },
+    onUpdateExpense: (ExpenseRecord) -> Unit = {},
+    onDeleteExpense: (Long) -> Unit = {},
+    onAddConsumable: (ConsumableItem) -> Unit = {},
+    onUpdateConsumable: (ConsumableItem) -> Unit = {},
+    onDeleteConsumable: (Long) -> Unit = {},
+    onSwitchTireSet: (Long, Float?, Float, String) -> Unit = { _, _, _, _ -> },
+    onMarkConsumableServiced: (ConsumableItem, Float, Float?, String, Boolean) -> Unit = { _, _, _, _, _ -> }
 ) {
     val ext = LocalSCrossColors.current
-    var selectedTab by remember(initialTab) { mutableIntStateOf(initialTab.coerceIn(0, 1)) }
+    var selectedTab by remember(initialTab, tabTriggerKey) {
+        mutableIntStateOf(initialTab.coerceIn(0, 2))
+    }
 
     Scaffold(
         containerColor = ext.background,
@@ -94,7 +111,8 @@ fun PhoneDashboardScreen(
                             Text(
                                 text = "Дашборд",
                                 fontWeight = if (selectedTab == 0) FontWeight.Bold else FontWeight.Normal,
-                                maxLines = 1
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         },
                         colors = NavigationBarItemDefaults.colors(
@@ -111,13 +129,38 @@ fun PhoneDashboardScreen(
                         icon = {
                             Icon(
                                 imageVector = Icons.Rounded.BarChart,
-                                contentDescription = "Архів та Статистика"
+                                contentDescription = "Статистика"
                             )
                         },
                         label = {
                             Text(
-                                text = "Архів та Статистика",
+                                text = "Статистика",
                                 fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = ext.accentBlue,
+                            selectedTextColor = ext.accentBlue,
+                            unselectedIconColor = ext.textMuted,
+                            unselectedTextColor = ext.textMuted,
+                            indicatorColor = ext.navIndicator
+                        )
+                    )
+                    NavigationBarItem(
+                        selected = selectedTab == 2,
+                        onClick = { selectedTab = 2 },
+                        icon = {
+                            Icon(
+                                imageVector = Icons.Rounded.AccountBalanceWallet,
+                                contentDescription = "Витрати"
+                            )
+                        },
+                        label = {
+                            Text(
+                                text = "Витрати",
+                                fontWeight = if (selectedTab == 2) FontWeight.Bold else FontWeight.Normal,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -140,8 +183,8 @@ fun PhoneDashboardScreen(
                 .statusBarsPadding()
                 .padding(innerPadding)
         ) {
-            if (selectedTab == 0) {
-                LiveDashboardTab(
+            when (selectedTab) {
+                0 -> LiveDashboardTab(
                     state = state,
                     settings = settings,
                     pairedDevices = pairedDevices,
@@ -161,8 +204,7 @@ fun PhoneDashboardScreen(
                     onThemeModeChanged = onThemeModeChanged,
                     onHeadlightsReminderChanged = onHeadlightsReminderChanged
                 )
-            } else {
-                TripAnalyticsTab(
+                1 -> TripAnalyticsTab(
                     trips = trips,
                     totalLogFilesCount = csvStats.totalLogFilesCount,
                     csvFileExists = csvFileExists,
@@ -170,6 +212,23 @@ fun PhoneDashboardScreen(
                     onExportAllZip = onExportAllZip,
                     onDeleteTrip = onDeleteTrip,
                     onClearTrips = onClearTrips
+                )
+                else -> ExpensesTab(
+                    expenses = expenses,
+                    consumables = consumables,
+                    trips = trips,
+                    currentOdometerKm = settings.odometerKm,
+                    defaultFuelPriceUah = settings.fuelPriceUah,
+                    onUpdateOdometer = onUpdateOdometer,
+                    onAddExpense = onAddExpense,
+                    onUpdateExpense = onUpdateExpense,
+                    onDeleteExpense = onDeleteExpense,
+                    onAddConsumable = onAddConsumable,
+                    onUpdateConsumable = onUpdateConsumable,
+                    onDeleteConsumable = onDeleteConsumable,
+                    onSwitchTireSet = onSwitchTireSet,
+                    onMarkConsumableServiced = onMarkConsumableServiced,
+                    onExportAllZip = onExportAllZip
                 )
             }
         }

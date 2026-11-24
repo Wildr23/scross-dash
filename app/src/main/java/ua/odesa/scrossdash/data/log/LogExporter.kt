@@ -20,7 +20,8 @@ import java.util.zip.ZipOutputStream
 
 class LogExporter(
     private val context: Context,
-    private val logger: TelemetryCsvLogger
+    private val logger: TelemetryCsvLogger,
+    private val extraZipEntriesProvider: (() -> Map<String, String>)? = null
 ) {
 
     fun exportAndShareLatestLog() {
@@ -45,7 +46,8 @@ class LogExporter(
 
     fun exportAllLogsAsZip() {
         logger.flush()
-        exportAllLogsAsZip(context)
+        val extras = extraZipEntriesProvider?.invoke().orEmpty()
+        exportAllLogsAsZip(context, extras)
     }
 
     private fun exportAndShareSingleFile(logFile: File) {
@@ -78,14 +80,18 @@ class LogExporter(
     }
 
     companion object {
-        fun exportAllLogsAsZip(context: Context) {
+        fun exportAllLogsAsZip(context: Context, extraEntries: Map<String, String> = emptyMap()) {
             val logDir = File(context.filesDir, "logs")
             val csvFiles = logDir.listFiles { _, name -> name.endsWith(".csv") }
                 ?.filter { it.exists() && it.length() > 0L }
                 ?.sortedByDescending { it.lastModified() }
                 ?: emptyList()
 
-            if (csvFiles.isEmpty()) {
+            val validExtras = extraEntries.filter { (name, content) ->
+                name.isNotBlank() && content.isNotBlank()
+            }
+
+            if (csvFiles.isEmpty() && validExtras.isEmpty()) {
                 Toast.makeText(context, "Немає доступних CSV логів для архівування", Toast.LENGTH_SHORT).show()
                 return
             }
@@ -105,6 +111,11 @@ class LogExporter(
                             zos.closeEntry()
                         }
                     }
+                    for ((entryName, content) in validExtras) {
+                        zos.putNextEntry(ZipEntry(entryName))
+                        zos.write(content.toByteArray(Charsets.UTF_8))
+                        zos.closeEntry()
+                    }
                 }
 
                 saveToDownloads(context, zipFile, "application/zip")
@@ -115,16 +126,20 @@ class LogExporter(
                     zipFile
                 )
 
+                val totalFiles = csvFiles.size + validExtras.size
                 val shareIntent = Intent(Intent.ACTION_SEND).apply {
                     type = "application/zip"
                     putExtra(Intent.EXTRA_STREAM, uri)
-                    putExtra(Intent.EXTRA_SUBJECT, "S-Cross Telemetry Archive (${csvFiles.size} CSV)")
-                    putExtra(Intent.EXTRA_TEXT, "Архів усіх телеметричних логів Suzuki S-Cross 48V (${csvFiles.size} файлів)")
+                    putExtra(Intent.EXTRA_SUBJECT, "S-Cross Telemetry Archive ($totalFiles файлів)")
+                    putExtra(
+                        Intent.EXTRA_TEXT,
+                        "Архів даних Suzuki S-Cross 48V (${csvFiles.size} телеметричних CSV + ${validExtras.size} звітів витрат/ТО)"
+                    )
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
 
-                val chooser = Intent.createChooser(shareIntent, "Експортувати всі логи (ZIP)").apply {
+                val chooser = Intent.createChooser(shareIntent, "Експортувати дані (ZIP)").apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 context.startActivity(chooser)

@@ -9,6 +9,7 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 import ua.odesa.scrossdash.MainActivity
 import ua.odesa.scrossdash.R
+import ua.odesa.scrossdash.data.db.AutoRefuelEvent
 import ua.odesa.scrossdash.data.db.TripRecord
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -18,6 +19,7 @@ class TripNotificationHelper(private val context: Context) {
     companion object {
         const val SUMMARY_CHANNEL_ID = "scross_trip_summary_channel"
         const val SUMMARY_NOTIFICATION_ID = 4802
+        const val REFUEL_NOTIFICATION_ID = 4803
         const val EXTRA_INITIAL_TAB = "extra_initial_tab"
     }
 
@@ -81,6 +83,50 @@ class TripNotificationHelper(private val context: Context) {
 
             val manager = context.getSystemService(NotificationManager::class.java)
             manager?.notify(SUMMARY_NOTIFICATION_ID, notification)
+        } catch (_: SecurityException) {
+            // POST_NOTIFICATIONS permission not granted on Android 13+
+        } catch (_: Exception) {
+        }
+    }
+
+    fun postAutoRefuelNotice(event: AutoRefuelEvent) {
+        try {
+            ensureChannel()
+
+            val launchIntent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra(EXTRA_INITIAL_TAB, 2) // Open Expenses & Maintenance tab
+            }
+            val pendingIntent = PendingIntent.getActivity(
+                context,
+                REFUEL_NOTIFICATION_ID,
+                launchIntent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+
+            val fullSuffix = if (event.isFullTank) " • Повний бак" else ""
+            val title = String.format(
+                Locale.US,
+                "⛽ Заправка: +%.1f л (~%d грн)%s",
+                event.addedLiters,
+                event.estimatedCostUah.roundToInt(),
+                fullSuffix
+            )
+            val body = "Додано у «Витрати» (АВТО) • Натисніть, щоб уточнити суму з чека"
+
+            val notification = NotificationCompat.Builder(context, SUMMARY_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_launcher)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .setSilent(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+
+            val manager = context.getSystemService(NotificationManager::class.java)
+            manager?.notify(REFUEL_NOTIFICATION_ID, notification)
         } catch (_: SecurityException) {
             // POST_NOTIFICATIONS permission not granted on Android 13+
         } catch (_: Exception) {

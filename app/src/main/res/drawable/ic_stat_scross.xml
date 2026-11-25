@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- Roofline contour -->
+    <path
+        android:pathData="M 5.8,7.0 L 7.6,4.5 Q 12,3.6 16.4,4.5 L 18.2,7.0"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="1.4" />
+
+    <!-- Hood brow -->
+    <path
+        android:pathData="M 3.0,9.8 Q 7.2,8.0 12.0,8.0 Q 16.8,8.0 21.0,9.8"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="1.5" />
+
+    <!-- Grille crossbar + diamond -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 9.0,11.3 L 15.0,11.3 L 14.7,12.5 L 9.3,12.5 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 12.0,10.6 L 13.1,11.9 L 12.0,13.2 L 10.9,11.9 Z" />
+
+    <!-- Left 3 LED segments -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 3.2,10.8 L 4.6,11.0 L 4.3,13.2 L 2.9,13.0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 5.2,11.0 L 6.6,11.2 L 6.3,13.4 L 4.9,13.2 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 7.2,11.2 L 8.6,11.4 L 8.3,13.6 L 6.9,13.4 Z" />
+
+    <!-- Right 3 LED segments -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 20.8,10.8 L 19.4,11.0 L 19.7,13.2 L 21.1,13.0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 18.8,11.0 L 17.4,11.2 L 17.7,13.4 L 19.1,13.2 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 16.8,11.2 L 15.4,11.4 L 15.7,13.6 L 17.1,13.4 Z" />
+
+    <!-- Bottom telemetry arc -->
+    <path
+        android:pathData="M 5.0,16.2 A 9.0,9.0 0 0,0 19.0,16.2"
+        android:strokeColor="#FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="1.6" />
+</vector>

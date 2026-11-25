@@ -283,7 +283,7 @@ private fun LiveDashboardTab(
         // Header
         Column(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
             Text(
-                text = "S-Cross Hybrid Dash",
+                text = "S-Cross Dash",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.ExtraBold,
                 color = ext.textPrimary

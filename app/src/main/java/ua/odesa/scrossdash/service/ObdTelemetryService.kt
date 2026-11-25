@@ -201,7 +201,7 @@ class ObdTelemetryService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("S-Cross 48V: запис телеметрії в Android Auto")
             .setContentText(contentText)
-            .setSmallIcon(R.drawable.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_scross)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)

@@ -37,6 +37,7 @@ class CarBluetoothReceiver : BroadcastReceiver() {
                 ContextCompat.startForegroundService(context, serviceIntent)
             }
             BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+                if (!ObdTelemetryService.isRunning) return
                 val serviceIntent = Intent(context, ObdTelemetryService::class.java).apply {
                     this.action = ObdTelemetryService.ACTION_CAR_BT_DISCONNECTED
                 }

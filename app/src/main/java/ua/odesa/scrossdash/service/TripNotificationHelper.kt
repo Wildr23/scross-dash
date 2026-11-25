@@ -11,6 +11,7 @@ import ua.odesa.scrossdash.MainActivity
 import ua.odesa.scrossdash.R
 import ua.odesa.scrossdash.data.db.AutoRefuelEvent
 import ua.odesa.scrossdash.data.db.TripRecord
+import ua.odesa.scrossdash.receiver.RefuelActionReceiver
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -20,6 +21,8 @@ class TripNotificationHelper(private val context: Context) {
         const val SUMMARY_CHANNEL_ID = "scross_trip_summary_channel"
         const val SUMMARY_NOTIFICATION_ID = 4802
         const val REFUEL_NOTIFICATION_ID = 4803
+        private const val REFUEL_CONFIRM_REQ_CODE = 4804
+        private const val REFUEL_DISMISS_REQ_CODE = 4805
         const val EXTRA_INITIAL_TAB = "extra_initial_tab"
     }
 
@@ -112,7 +115,27 @@ class TripNotificationHelper(private val context: Context) {
                 event.estimatedCostUah.roundToInt(),
                 fullSuffix
             )
-            val body = "Додано у «Витрати» (АВТО) • Натисніть, щоб уточнити суму з чека"
+            val body = "Підтвердіть або скасуйте, перш ніж додати у «Витрати»"
+
+            val confirmIntent = Intent(context, RefuelActionReceiver::class.java).apply {
+                action = RefuelActionReceiver.ACTION_CONFIRM_REFUEL
+            }
+            val confirmPendingIntent = PendingIntent.getBroadcast(
+                context,
+                REFUEL_CONFIRM_REQ_CODE,
+                confirmIntent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+
+            val dismissIntent = Intent(context, RefuelActionReceiver::class.java).apply {
+                action = RefuelActionReceiver.ACTION_DISMISS_REFUEL
+            }
+            val dismissPendingIntent = PendingIntent.getBroadcast(
+                context,
+                REFUEL_DISMISS_REQ_CODE,
+                dismissIntent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
 
             val notification = NotificationCompat.Builder(context, SUMMARY_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_launcher)
@@ -120,6 +143,8 @@ class TripNotificationHelper(private val context: Context) {
                 .setContentText(body)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(body))
                 .setContentIntent(pendingIntent)
+                .addAction(0, "Підтвердити", confirmPendingIntent)
+                .addAction(0, "Скасувати", dismissPendingIntent)
                 .setAutoCancel(true)
                 .setSilent(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -129,6 +154,14 @@ class TripNotificationHelper(private val context: Context) {
             manager?.notify(REFUEL_NOTIFICATION_ID, notification)
         } catch (_: SecurityException) {
             // POST_NOTIFICATIONS permission not granted on Android 13+
+        } catch (_: Exception) {
+        }
+    }
+
+    fun cancelRefuelNotice() {
+        try {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            manager?.cancel(REFUEL_NOTIFICATION_ID)
         } catch (_: Exception) {
         }
     }

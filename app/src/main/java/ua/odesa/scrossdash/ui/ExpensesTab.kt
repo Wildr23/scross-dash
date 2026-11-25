@@ -42,6 +42,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import ua.odesa.scrossdash.data.db.*
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -87,6 +88,7 @@ private data class ExpenseDraft(
     val pricePerLiter: Float? = null,
     val isFullTank: Boolean = false,
     val isAutoDetected: Boolean = false,
+    val isFromPendingRefuel: Boolean = false,
     val linkedItemId: Long? = null,
     val note: String = ""
 )
@@ -98,6 +100,10 @@ fun ExpensesTab(
     trips: List<TripRecord>,
     currentOdometerKm: Float,
     defaultFuelPriceUah: Float,
+    pendingRefuel: AutoRefuelEvent? = null,
+    onConfirmPendingRefuel: () -> Unit = {},
+    onConfirmPendingRefuelEdited: (ExpenseRecord) -> Unit = {},
+    onDismissPendingRefuel: () -> Unit = {},
     onUpdateOdometer: (Float) -> Unit,
     onAddExpense: (ExpenseRecord, Long?) -> Unit,
     onUpdateExpense: (ExpenseRecord) -> Unit,
@@ -112,13 +118,14 @@ fun ExpensesTab(
     val ext = LocalSCrossColors.current
     val cardBorder = BorderStroke(1.dp, ext.cardBorder)
     val dateFormat = remember { SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()) }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val uiScope = rememberCoroutineScope()
 
     var selectedSubTab by remember { mutableIntStateOf(0) }
     var selectedPeriod by remember { mutableStateOf(ExpensePeriod.MONTH) }
     var selectedCategoryFilter by remember { mutableStateOf<ExpenseCategory?>(null) }
 
     var editingExpenseDraft by remember { mutableStateOf<ExpenseDraft?>(null) }
-    var expensePendingDelete by remember { mutableStateOf<ExpenseRecord?>(null) }
 
     var showOdometerDialog by remember { mutableStateOf(false) }
     var editingConsumable by remember { mutableStateOf<ConsumableItem?>(null) }
@@ -156,48 +163,12 @@ fun ExpensesTab(
             consumables = consumables,
             onDismiss = { editingExpenseDraft = null },
             onSave = { record, linkedConsId ->
-                if (draft.existingId != null) {
-                    onUpdateExpense(record.copy(id = draft.existingId))
-                } else {
-                    onAddExpense(record, linkedConsId)
+                when {
+                    draft.isFromPendingRefuel -> onConfirmPendingRefuelEdited(record)
+                    draft.existingId != null -> onUpdateExpense(record.copy(id = draft.existingId))
+                    else -> onAddExpense(record, linkedConsId)
                 }
                 editingExpenseDraft = null
-            }
-        )
-    }
-
-    expensePendingDelete?.let { pending ->
-        AlertDialog(
-            onDismissRequest = { expensePendingDelete = null },
-            containerColor = ext.card,
-            titleContentColor = ext.textPrimary,
-            textContentColor = ext.textSecondary,
-            title = { Text("Видалити запис?", fontWeight = FontWeight.Bold) },
-            text = {
-                Text(
-                    String.format(
-                        Locale.US,
-                        "«%s» (%.0f грн) від %s буде видалено з історії витрат.",
-                        pending.title,
-                        pending.amountUah,
-                        dateFormat.format(Date(pending.timestampMs))
-                    )
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        onDeleteExpense(pending.id)
-                        expensePendingDelete = null
-                    }
-                ) {
-                    Text("Видалити", color = ext.accentRed, fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { expensePendingDelete = null }) {
-                    Text("Скасувати", color = ext.textMuted)
-                }
             }
         )
     }
@@ -267,150 +238,286 @@ fun ExpensesTab(
         )
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        // Header
-        Row(
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "Витрати та ТО",
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = ext.textPrimary
+            // Header
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Витрати та ТО",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = ext.textPrimary
+                    )
+                    Text(
+                        text = "Авто-заправки, вартість 1 км, шини й регламент",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = ext.textMuted
+                    )
+                }
+                if (selectedSubTab == 0) {
+                    FilledTonalButton(
+                        onClick = {
+                            editingExpenseDraft = ExpenseDraft(
+                                category = ExpenseCategory.FUEL,
+                                pricePerLiter = defaultFuelPriceUah,
+                                odometerKm = currentOdometerKm
+                            )
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Add,
+                            contentDescription = "Додати",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Додати", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            // Top 2-way Segmented Switcher
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                SubTabChip(
+                    modifier = Modifier.weight(1f),
+                    title = "Гроші / Історія",
+                    badgeCount = 0,
+                    selected = selectedSubTab == 0,
+                    onClick = { selectedSubTab = 0 },
+                    ext = ext
                 )
-                Text(
-                    text = "Авто-заправки, вартість 1 км, шини й регламент",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = ext.textMuted
+                SubTabChip(
+                    modifier = Modifier.weight(1f),
+                    title = "ТО та Розхідники",
+                    badgeCount = urgentConsumablesCount,
+                    selected = selectedSubTab == 1,
+                    onClick = { selectedSubTab = 1 },
+                    ext = ext
                 )
             }
-            if (selectedSubTab == 0) {
-                FilledTonalButton(
-                    onClick = {
+
+            // Pending Refuel Confirm/Dismiss Banner (never pollutes expenses silently)
+            if (pendingRefuel != null) {
+                PendingRefuelBannerCard(
+                    event = pendingRefuel,
+                    ext = ext,
+                    onConfirm = onConfirmPendingRefuel,
+                    onEditAndConfirm = {
                         editingExpenseDraft = ExpenseDraft(
+                            timestampMs = pendingRefuel.timestampMs,
                             category = ExpenseCategory.FUEL,
-                            pricePerLiter = defaultFuelPriceUah,
+                            title = if (pendingRefuel.isFullTank) "Авто-заправка (повний бак)" else "Авто-заправка",
+                            amountUah = pendingRefuel.estimatedCostUah,
+                            odometerKm = pendingRefuel.odometerKm,
+                            liters = pendingRefuel.addedLiters,
+                            pricePerLiter = pendingRefuel.pricePerLiterUah,
+                            isFullTank = pendingRefuel.isFullTank,
+                            isAutoDetected = true,
+                            isFromPendingRefuel = true,
+                            note = "Підтверджена авто-заправка (PID 0x2F)"
+                        )
+                    },
+                    onDismiss = onDismissPendingRefuel
+                )
+            }
+
+            if (selectedSubTab == 0) {
+                ExpensesMoneySubTab(
+                    ext = ext,
+                    cardBorder = cardBorder,
+                    selectedPeriod = selectedPeriod,
+                    onPeriodChanged = { selectedPeriod = it },
+                    summary = summary,
+                    fullToFullL100 = fullToFullL100,
+                    selectedCategoryFilter = selectedCategoryFilter,
+                    onCategoryFilterChanged = { selectedCategoryFilter = it },
+                    visibleExpenses = visibleExpenses,
+                    dateFormat = dateFormat,
+                    onQuickAdd = { category, presetTitle ->
+                        editingExpenseDraft = ExpenseDraft(
+                            category = category,
+                            title = presetTitle,
+                            pricePerLiter = if (category == ExpenseCategory.FUEL) defaultFuelPriceUah else null,
                             odometerKm = currentOdometerKm
                         )
                     },
-                    shape = RoundedCornerShape(12.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Add,
-                        contentDescription = "Додати",
-                        modifier = Modifier.size(18.dp)
+                    onEditExpense = { rec ->
+                        editingExpenseDraft = ExpenseDraft(
+                            existingId = rec.id,
+                            timestampMs = rec.timestampMs,
+                            category = rec.category,
+                            title = rec.title,
+                            amountUah = rec.amountUah,
+                            odometerKm = rec.odometerKm,
+                            liters = rec.liters,
+                            pricePerLiter = rec.pricePerLiter ?: defaultFuelPriceUah.takeIf { rec.category == ExpenseCategory.FUEL },
+                            isFullTank = rec.isFullTank,
+                            isAutoDetected = rec.isAutoDetected,
+                            linkedItemId = rec.linkedItemId,
+                            note = rec.note
+                        )
+                    },
+                    onRequestDelete = { rec ->
+                        onDeleteExpense(rec.id)
+                        uiScope.launch {
+                            snackbarHostState.currentSnackbarData?.dismiss()
+                            val res = snackbarHostState.showSnackbar(
+                                message = "Видалено: «${rec.title.ifBlank { rec.category.label }}»",
+                                actionLabel = "Повернути",
+                                duration = SnackbarDuration.Short
+                            )
+                            if (res == SnackbarResult.ActionPerformed) {
+                                onAddExpense(rec.copy(id = 0L), null)
+                            }
+                        }
+                    },
+                    onExportAllZip = onExportAllZip
+                )
+            } else {
+                MaintenanceConsumablesSubTab(
+                    ext = ext,
+                    cardBorder = cardBorder,
+                    consumables = consumables,
+                    currentOdometerKm = currentOdometerKm,
+                    dateFormat = dateFormat,
+                    onEditOdometer = { showOdometerDialog = true },
+                    onSwapTires = { target -> tireSwapTarget = target },
+                    onEditConsumable = { item ->
+                        isAddingNewConsumable = false
+                        editingConsumable = item
+                    },
+                    onAddNewConsumable = {
+                        isAddingNewConsumable = true
+                        editingConsumable = ConsumableItem(
+                            name = "",
+                            category = ExpenseCategory.MAINTENANCE,
+                            intervalKm = 10_000,
+                            intervalMonths = 12,
+                            lastDoneKm = currentOdometerKm,
+                            lastDoneTimeMs = System.currentTimeMillis()
+                        )
+                    },
+                    onMarkServiced = { item, resetTireKm ->
+                        serviceDialogTarget = item to resetTireKm
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(12.dp)
+        )
+    }
+}
+
+@Composable
+private fun PendingRefuelBannerCard(
+    event: AutoRefuelEvent,
+    ext: SCrossExtendedColors,
+    onConfirm: () -> Unit,
+    onEditAndConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = ext.refuelBoxBg),
+        border = BorderStroke(1.5.dp, ext.selectedBlueBorder),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.LocalGasStation,
+                    contentDescription = "Заправка",
+                    tint = ext.accentBlue,
+                    modifier = Modifier.size(22.dp)
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Виявлено заправку",
+                        color = ext.textPrimary,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleSmall
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Додати", fontWeight = FontWeight.Bold)
+                    val fullSuffix = if (event.isFullTank) " • Повний бак" else ""
+                    Text(
+                        text = String.format(
+                            Locale.US,
+                            "+%.1f л • ~%.0f грн%s",
+                            event.addedLiters,
+                            event.estimatedCostUah,
+                            fullSuffix
+                        ),
+                        color = ext.accentBlue,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onConfirm,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ext.accentGreen,
+                        contentColor = Color.White
+                    ),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 6.dp)
+                ) {
+                    Text("Підтвердити", maxLines = 1, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(
+                    onClick = onEditAndConfirm,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, ext.selectedBlueBorder),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 6.dp)
+                ) {
+                    Text("Уточнити", color = ext.accentBlue, maxLines = 1, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                }
+                TextButton(
+                    onClick = onDismiss,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                ) {
+                    Text("Скасувати", color = ext.textMuted, maxLines = 1, style = MaterialTheme.typography.labelMedium)
                 }
             }
         }
-
-        // Top 2-way Segmented Switcher
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            SubTabChip(
-                modifier = Modifier.weight(1f),
-                title = "Гроші / Історія",
-                badgeCount = 0,
-                selected = selectedSubTab == 0,
-                onClick = { selectedSubTab = 0 },
-                ext = ext
-            )
-            SubTabChip(
-                modifier = Modifier.weight(1f),
-                title = "ТО та Розхідники",
-                badgeCount = urgentConsumablesCount,
-                selected = selectedSubTab == 1,
-                onClick = { selectedSubTab = 1 },
-                ext = ext
-            )
-        }
-
-        if (selectedSubTab == 0) {
-            ExpensesMoneySubTab(
-                ext = ext,
-                cardBorder = cardBorder,
-                selectedPeriod = selectedPeriod,
-                onPeriodChanged = { selectedPeriod = it },
-                summary = summary,
-                fullToFullL100 = fullToFullL100,
-                selectedCategoryFilter = selectedCategoryFilter,
-                onCategoryFilterChanged = { selectedCategoryFilter = it },
-                visibleExpenses = visibleExpenses,
-                dateFormat = dateFormat,
-                onQuickAdd = { category, presetTitle ->
-                    editingExpenseDraft = ExpenseDraft(
-                        category = category,
-                        title = presetTitle,
-                        pricePerLiter = if (category == ExpenseCategory.FUEL) defaultFuelPriceUah else null,
-                        odometerKm = currentOdometerKm
-                    )
-                },
-                onEditExpense = { rec ->
-                    editingExpenseDraft = ExpenseDraft(
-                        existingId = rec.id,
-                        timestampMs = rec.timestampMs,
-                        category = rec.category,
-                        title = rec.title,
-                        amountUah = rec.amountUah,
-                        odometerKm = rec.odometerKm,
-                        liters = rec.liters,
-                        pricePerLiter = rec.pricePerLiter ?: defaultFuelPriceUah.takeIf { rec.category == ExpenseCategory.FUEL },
-                        isFullTank = rec.isFullTank,
-                        isAutoDetected = rec.isAutoDetected,
-                        linkedItemId = rec.linkedItemId,
-                        note = rec.note
-                    )
-                },
-                onRequestDelete = { rec -> expensePendingDelete = rec },
-                onExportAllZip = onExportAllZip
-            )
-        } else {
-            MaintenanceConsumablesSubTab(
-                ext = ext,
-                cardBorder = cardBorder,
-                consumables = consumables,
-                currentOdometerKm = currentOdometerKm,
-                dateFormat = dateFormat,
-                onEditOdometer = { showOdometerDialog = true },
-                onSwapTires = { target -> tireSwapTarget = target },
-                onEditConsumable = { item ->
-                    isAddingNewConsumable = false
-                    editingConsumable = item
-                },
-                onAddNewConsumable = {
-                    isAddingNewConsumable = true
-                    editingConsumable = ConsumableItem(
-                        name = "",
-                        category = ExpenseCategory.MAINTENANCE,
-                        intervalKm = 10_000,
-                        intervalMonths = 12,
-                        lastDoneKm = currentOdometerKm,
-                        lastDoneTimeMs = System.currentTimeMillis()
-                    )
-                },
-                onMarkServiced = { item, resetTireKm ->
-                    serviceDialogTarget = item to resetTireKm
-                }
-            )
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
     }
 }
 

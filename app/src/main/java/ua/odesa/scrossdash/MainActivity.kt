@@ -49,6 +49,7 @@ class MainActivity : ComponentActivity() {
             val trips by app.tripRepository.trips.collectAsState()
             val expenses by app.expenseRepository.expenses.collectAsState()
             val consumables by app.expenseRepository.consumables.collectAsState()
+            val pendingRefuel by app.expenseRepository.pendingRefuel.collectAsState()
             val csvStats by app.csvLogger.stats.collectAsState()
 
             val systemDark = isSystemInDarkTheme()
@@ -75,6 +76,7 @@ class MainActivity : ComponentActivity() {
                     trips = trips,
                     expenses = expenses,
                     consumables = consumables,
+                    pendingRefuel = pendingRefuel,
                     csvStats = csvStats,
                     initialTab = selectedInitialTab,
                     tabTriggerKey = tabTriggerKey,
@@ -109,6 +111,18 @@ class MainActivity : ComponentActivity() {
                         if (!enabled) app.telemetryEngine.dismissHeadlightsAlert()
                     },
                     onUpdateOdometer = { app.settingsRepository.updateOdometerKm(it) },
+                    onConfirmPendingRefuel = {
+                        app.expenseRepository.confirmPendingRefuel()
+                        app.tripNotificationHelper.cancelRefuelNotice()
+                    },
+                    onConfirmPendingRefuelEdited = { edited ->
+                        app.expenseRepository.confirmPendingRefuel(overrideRecord = edited)
+                        app.tripNotificationHelper.cancelRefuelNotice()
+                    },
+                    onDismissPendingRefuel = {
+                        app.expenseRepository.dismissPendingRefuel()
+                        app.tripNotificationHelper.cancelRefuelNotice()
+                    },
                     onAddExpense = { record, linkedConsId ->
                         app.expenseRepository.addExpense(record, linkedConsId)
                     },

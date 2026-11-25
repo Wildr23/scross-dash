@@ -12,6 +12,7 @@ import kotlinx.coroutines.withContext
 interface TripStore {
     val trips: StateFlow<List<TripRecord>>
     suspend fun upsertActiveTrip(record: TripRecord): Long
+    suspend fun deleteTripById(id: Long)
     suspend fun getLatestTrip(): TripRecord?
 }
 
@@ -42,10 +43,19 @@ class TripRepository(private val dbHelper: TripDatabaseHelper) : TripStore {
     }
 
     override suspend fun upsertActiveTrip(record: TripRecord): Long {
+        if (record.distanceKm < 0.20f) return 0L
         return withContext(Dispatchers.IO) {
             val assignedId = dbHelper.upsertTrip(record)
             _trips.value = dbHelper.getAllTrips()
             assignedId
+        }
+    }
+
+    override suspend fun deleteTripById(id: Long) {
+        if (id <= 0L) return
+        withContext(Dispatchers.IO) {
+            dbHelper.deleteTrip(id)
+            _trips.value = dbHelper.getAllTrips()
         }
     }
 

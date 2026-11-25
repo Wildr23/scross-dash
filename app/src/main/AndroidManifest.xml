@@ -69,6 +69,11 @@
             </intent-filter>
         </receiver>
 
+        <!-- Pending Auto-Refuel Notification Actions (Підтвердити / Скасувати) -->
+        <receiver
+            android:name=".receiver.RefuelActionReceiver"
+            android:exported="false" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="ua.odesa.scrossdash.fileprovider"

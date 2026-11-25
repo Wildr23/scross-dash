@@ -36,7 +36,10 @@ class SCrossApplication : Application() {
         settingsRepository = SettingsRepository(this)
         val dbHelper = TripDatabaseHelper(this)
         tripRepository = TripRepository(dbHelper)
-        expenseRepository = ExpenseRepository(dbHelper)
+        expenseRepository = ExpenseRepository(
+            dbHelper = dbHelper,
+            prefs = getSharedPreferences("scross_pending_refuel", MODE_PRIVATE)
+        )
         csvLogger = TelemetryCsvLogger(this)
         logExporter = LogExporter(
             context = this,

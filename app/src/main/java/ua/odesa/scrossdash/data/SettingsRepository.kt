@@ -11,8 +11,10 @@ interface SettingsStore {
     val settings: StateFlow<AppSettings>
     val calibratedTankLiters: StateFlow<Float>
     val isTankCalibrated: StateFlow<Boolean>
+    val lastStationaryFuelPct: StateFlow<Float>
     fun saveRemainingTankLiters(liters: Float)
     fun anchorTankToSensor(liters: Float)
+    fun saveLastStationaryFuelPct(pct: Float)
     fun markRefueledToFull()
     fun updateOdometerKm(odometerKm: Float)
     fun incrementOdometerKm(deltaKm: Float)
@@ -38,6 +40,11 @@ class SettingsRepository(context: Context) : SettingsStore {
 
     private val _isTankCalibrated = MutableStateFlow(initialCalibrated)
     override val isTankCalibrated: StateFlow<Boolean> = _isTankCalibrated.asStateFlow()
+
+    private val _lastStationaryFuelPct = MutableStateFlow(
+        prefs.getFloat("last_stationary_fuel_pct", 0f).coerceIn(0f, 100f)
+    )
+    override val lastStationaryFuelPct: StateFlow<Float> = _lastStationaryFuelPct.asStateFlow()
 
     private fun loadSettings(): AppSettings {
         // Migration: If previous default 1.15f was saved, migrate to accurate 1.00f
@@ -121,12 +128,19 @@ class SettingsRepository(context: Context) : SettingsStore {
         _isTankCalibrated.value = true
     }
 
+    override fun saveLastStationaryFuelPct(pct: Float) {
+        val clamped = pct.coerceIn(0f, 100f)
+        prefs.edit().putFloat("last_stationary_fuel_pct", clamped).apply()
+        _lastStationaryFuelPct.value = clamped
+    }
+
     /**
      * Called when user taps "Заправив до повного" on the phone or Android Auto screen.
      */
     override fun markRefueledToFull() {
         val fullCapacity = _settings.value.tankCapacityLiters
         anchorTankToSensor(fullCapacity)
+        saveLastStationaryFuelPct(95.0f)
     }
 
     @Synchronized

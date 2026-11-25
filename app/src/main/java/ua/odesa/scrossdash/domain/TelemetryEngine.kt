@@ -34,6 +34,13 @@ class TelemetryEngine(
     companion object {
         // S-Cross OEM float sensor caps near ~94.9% even when filled completely to click-off
         const val FULL_TANK_SENSOR_CEILING_PCT = 93.0f
+        const val MIN_STATIONARY_ANCHOR_SAMPLES = 12
+        const val MIN_STATIONARY_REFUEL_SAMPLES = 15
+        const val REFUEL_SENSOR_JUMP_PCT = 15.0f
+        const val MIN_ARCHIVE_TRIP_DISTANCE_KM = 0.20f
+        const val ECU_STANDBY_FINALIZE_SEC = 12.0f
+        const val RPM_ZERO_FINALIZE_SEC = 180.0f
+        const val OBD_DISCONNECT_TIMEOUT_MS = 60_000L
 
         fun computeEffectiveSensorLiters(medianPct: Float, tankCapacity: Float = 47.0f): Float {
             return if (medianPct >= FULL_TANK_SENSOR_CEILING_PCT) {
@@ -49,9 +56,10 @@ class TelemetryEngine(
 
     private var inMemoryRemainingLiters: Float = settingsRepo.calibratedTankLiters.value
 
-    // Rolling 10-sample median filter for PID 0x2F fuel level sensor
-    private val rawFuelSamples = ArrayDeque<Float>(10)
-    private var medianFuelPct: Float? = null
+    // Strict stationary-only buffer for PID 0x2F fuel level sensor
+    private val stationaryFuelSamples = ArrayDeque<Float>(20)
+    private var stationaryMedianPct: Float? = null
+    private var lastDisplayedFuelPct: Float? = null
     private var tripStartTankAnchorChecked: Boolean = false
 
     private val _state = MutableStateFlow(
@@ -84,7 +92,10 @@ class TelemetryEngine(
     private var lastAutoRefuelEmitMs = Long.MIN_VALUE
     private var stationarySec = 0f
     private var ecuSleepSec = 0f
-    private var ignitionOffLowVoltSec = 0f
+    private var zeroRpmSec = 0f
+    private var isAaProjectionActive = false
+    private var isEcuAwake = false
+    private var obdDisconnectedSinceMs = 0L
 
     // Rolling score accumulators (Eco starts at 0f Toyota-style, Care starts at 100f protection index)
     private var ecoAccelScore = 0f
@@ -134,9 +145,32 @@ class TelemetryEngine(
         drivingInDarknessSec = 0f
     }
 
+    fun setAndroidAutoProjectionActive(active: Boolean) {
+        isAaProjectionActive = active
+    }
+
+    fun isTripActiveNow(): Boolean = isTripActive
+
+    fun isObdConnectedAndAwake(): Boolean =
+        _state.value.isConnected && !_state.value.isDemoMode && isEcuAwake
+
+    fun checkDisconnectedTimeout(nowMs: Long = System.currentTimeMillis()): Boolean {
+        if (!_state.value.isConnected &&
+            !isAaProjectionActive &&
+            obdDisconnectedSinceMs > 0L &&
+            (nowMs - obdDisconnectedSinceMs) > OBD_DISCONNECT_TIMEOUT_MS
+        ) {
+            finalizeAndArchiveTrip(postSummaryNotification = true, reason = "OBD_DISCONNECT_TIMEOUT")
+            obdDisconnectedSinceMs = 0L
+            return true
+        }
+        return false
+    }
+
     fun onEcuSleepTick(dtSec: Float) {
+        isEcuAwake = false
         ecuSleepSec += dtSec
-        if (isTripActive && tripDistanceKm >= 0.2f && ecuSleepSec > 8f) {
+        if ((isTripActive || activeCsvFileName != null) && ecuSleepSec > ECU_STANDBY_FINALIZE_SEC) {
             finalizeAndArchiveTrip(postSummaryNotification = true, reason = "ECU_STANDBY")
         }
     }
@@ -146,15 +180,19 @@ class TelemetryEngine(
             csvLogger?.logEvent("ECU_WAKE")
         }
         ecuSleepSec = 0f
-        ignitionOffLowVoltSec = 0f
+        zeroRpmSec = 0f
+        isEcuAwake = true
+        obdDisconnectedSinceMs = 0L
         tripStartTankAnchorChecked = false
-        rawFuelSamples.clear()
-        medianFuelPct = null
+        stationaryFuelSamples.clear()
+        stationaryMedianPct = null
     }
 
-    fun onDisconnect() {
-        if (isTripActive && tripDistanceKm >= 0.2f) {
-            finalizeAndArchiveTrip(postSummaryNotification = true, reason = "OBD_DISCONNECT")
+    fun onDisconnect(nowMs: Long = System.currentTimeMillis()) {
+        // Keep active trip & CSV alive across brief BT/AA glitches; finalize only after > 60s timeout
+        isEcuAwake = false
+        if (obdDisconnectedSinceMs == 0L) {
+            obdDisconnectedSinceMs = nowMs
         }
         _state.value = _state.value.copy(
             isConnected = false,
@@ -194,10 +232,10 @@ class TelemetryEngine(
         lastAutoSaveTimeMs = 0L
         pendingOdometerDeltaKm = 0f
         ecuSleepSec = 0f
-        ignitionOffLowVoltSec = 0f
+        zeroRpmSec = 0f
         tripStartTankAnchorChecked = false
-        rawFuelSamples.clear()
-        medianFuelPct = null
+        stationaryFuelSamples.clear()
+        stationaryMedianPct = null
         resetTripScores()
 
         _state.value = _state.value.copy(
@@ -245,9 +283,17 @@ class TelemetryEngine(
             expenseStore?.addDistanceToMountedTire(remainingDelta)
         }
 
-        if (!isTripActive && tripDistanceKm < 0.2f) {
+        if (!isTripActive && tripDistanceKm < MIN_ARCHIVE_TRIP_DISTANCE_KM) {
+            val staleId = activeTripId
+            if (staleId != null && staleId > 0L) {
+                scope.launch {
+                    dbMutex.withLock {
+                        tripRepo?.deleteTripById(staleId)
+                    }
+                }
+            }
             if (activeCsvFileName != null) {
-                csvLogger?.closeSession()
+                csvLogger?.discardSession()
                 activeCsvFileName = null
             }
             return
@@ -271,7 +317,7 @@ class TelemetryEngine(
         val capturedTank = inMemoryRemainingLiters
         val settings = settingsRepo.settings.value
 
-        if (!isDemo && capturedDist >= 0.2f) {
+        if (!isDemo && capturedDist >= MIN_ARCHIVE_TRIP_DISTANCE_KM) {
             val record = TripRecord(
                 id = capturedId,
                 startTimeMs = capturedStart,
@@ -300,7 +346,18 @@ class TelemetryEngine(
                 onTripFinalized?.invoke(record)
             }
         } else {
-            csvLogger?.closeSession()
+            if (!isDemo && capturedId > 0L) {
+                scope.launch {
+                    dbMutex.withLock {
+                        tripRepo?.deleteTripById(capturedId)
+                    }
+                }
+            }
+            if (capturedDist < MIN_ARCHIVE_TRIP_DISTANCE_KM) {
+                csvLogger?.discardSession()
+            } else {
+                csvLogger?.closeSession()
+            }
         }
 
         // Immediately reset all in-memory trip metrics to zero for a clean next ignition cycle
@@ -309,7 +366,7 @@ class TelemetryEngine(
 
     private fun autoSaveActiveTrip(now: Long) {
         if (_state.value.isDemoMode) return
-        if (!isTripActive || tripDistanceKm < 0.1f) return
+        if (!isTripActive || tripDistanceKm < MIN_ARCHIVE_TRIP_DISTANCE_KM) return
         if (now - lastAutoSaveTimeMs < 10_000L) return
 
         lastAutoSaveTimeMs = now
@@ -370,13 +427,14 @@ class TelemetryEngine(
      * (applying the >= 93% full-tank ceiling rule).
      */
     fun syncTankToSensor(): Boolean {
-        val sensorPct = medianFuelPct ?: return false
+        val sensorPct = stationaryMedianPct ?: lastDisplayedFuelPct ?: return false
         val cap = settingsRepo.settings.value.tankCapacityLiters
         val sensorLiters = computeEffectiveSensorLiters(sensorPct, cap)
         inMemoryRemainingLiters = sensorLiters
         persistedFuelCounterLiters = 0f
         if (!_state.value.isDemoMode) {
             settingsRepo.anchorTankToSensor(sensorLiters)
+            stationaryMedianPct?.let { settingsRepo.saveLastStationaryFuelPct(it) }
         }
         _state.value = _state.value.copy(
             fuelTank = buildFuelTankInfo(sensorLiters, effectiveAvgForRange())
@@ -397,6 +455,8 @@ class TelemetryEngine(
         val deltaThrottlePct = if (prev != null) snap.throttlePct - prev.throttlePct else 0f
         lastSnapshot = snap
         ecuSleepSec = 0f
+        isEcuAwake = true
+        obdDisconnectedSinceMs = 0L
 
         // Preserve last valid coolant temperature when engine shuts down (rpm < 300)
         if (snap.rpm >= 300 || !hasValidCoolantTemp) {
@@ -423,15 +483,15 @@ class TelemetryEngine(
             csvLogger?.logEvent("TRIP_START")
         }
 
-        // Ignition-off guard when ECU stays alive on ACC: RPM == 0 && voltage < 13.0V for > 20s after >= 0.2 km
-        if (snap.rpm == 0 && snap.voltage12v < 13.0f) {
-            ignitionOffLowVoltSec += dtSec
-            if (isTripActive && tripDistanceKm >= 0.2f && ignitionOffLowVoltSec > 20f) {
-                finalizeAndArchiveTrip(postSummaryNotification = true, reason = "LOW_VOLT_IGNITION_OFF")
+        // True ignition-off guard when ECU stays alive on ACC: continuous RPM == 0 for > 180s
+        if (snap.rpm == 0) {
+            zeroRpmSec += dtSec
+            if (isTripActive && zeroRpmSec > RPM_ZERO_FINALIZE_SEC) {
+                finalizeAndArchiveTrip(postSummaryNotification = true, reason = "RPM_ZERO_TIMEOUT")
                 return
             }
         } else {
-            ignitionOffLowVoltSec = 0f
+            zeroRpmSec = 0f
         }
 
         // 1. Instantaneous Fuel Consumption (MAF / Speed-Density + Lambda)
@@ -519,11 +579,9 @@ class TelemetryEngine(
         }
 
         // 3. Zero-Touch Fuel Tank Estimator (47 L)
-        // Collect 10-sample rolling median of valid PID 0x2F readings; never re-anchor at traffic lights mid-trip.
+        // Strict stationary-only anchoring (>= 12 samples at speed == 0) & refuel detection (>= 15 samples & >= +15% over stationary baseline).
         if (snap.rawFuelLevelPct != null && snap.rawFuelLevelPct > 0f) {
-            if (rawFuelSamples.size >= 10) rawFuelSamples.removeFirst()
-            rawFuelSamples.addLast(snap.rawFuelLevelPct)
-            medianFuelPct = computeMedian(rawFuelSamples)
+            lastDisplayedFuelPct = snap.rawFuelLevelPct
         }
 
         inMemoryRemainingLiters = (inMemoryRemainingLiters - deltaFuelLiters)
@@ -534,57 +592,101 @@ class TelemetryEngine(
             tripStartTankAnchorChecked = true
         }
 
-        if (snap.speedKmh == 0) {
-            stationarySec += dtSec
-        } else {
+        if (snap.speedKmh > 0) {
             stationarySec = 0f
-        }
+            stationaryFuelSamples.clear()
+            stationaryMedianPct = null
+        } else {
+            stationarySec += dtSec
+            if (snap.rawFuelLevelPct != null && snap.rawFuelLevelPct > 0f) {
+                if (stationaryFuelSamples.size >= 20) stationaryFuelSamples.removeFirst()
+                stationaryFuelSamples.addLast(snap.rawFuelLevelPct)
+            }
 
-        val medPctNow = medianFuelPct
-        if (medPctNow != null) {
-            val effectiveSensorLiters = computeEffectiveSensorLiters(medPctNow, settings.tankCapacityLiters)
-            val sensorDelta = effectiveSensorLiters - inMemoryRemainingLiters
-            val isCalibrated = settingsRepo.isTankCalibrated.value
-            val prevTankLiters = inMemoryRemainingLiters
+            if (stationaryFuelSamples.size >= MIN_STATIONARY_ANCHOR_SAMPLES) {
+                val statMed = computeMedian(stationaryFuelSamples)
+                stationaryMedianPct = statMed
+                val effectiveSensorLiters = computeEffectiveSensorLiters(statMed, settings.tankCapacityLiters)
+                val isCalibrated = settingsRepo.isTankCalibrated.value
+                val baselinePct = settingsRepo.lastStationaryFuelPct.value
 
-            when {
-                // 1. Initial connection when tank was never calibrated yet (stationary to avoid motion slosh)
-                !isCalibrated && snap.speedKmh == 0 -> {
-                    inMemoryRemainingLiters = effectiveSensorLiters
-                    tripStartTankAnchorChecked = true
-                    persistedFuelCounterLiters = 0f
-                    if (!_state.value.isDemoMode) {
-                        settingsRepo.anchorTankToSensor(inMemoryRemainingLiters)
-                    }
-                    csvLogger?.logEvent("TANK_ANCHORED_INIT:${String.format(Locale.US, "%.1f", inMemoryRemainingLiters)}L")
-                }
-
-                // 2. Once at the very start of a new trip (< 0.05 km) after collecting valid sensor samples
-                isCalibrated && !tripStartTankAnchorChecked && tripDistanceKm < 0.05f -> {
-                    tripStartTankAnchorChecked = true
-                    if (abs(sensorDelta) > 6.5f || sensorDelta > 5.0f) {
+                when {
+                    // 1. Initial connection when tank was never calibrated yet (stationary only)
+                    !isCalibrated -> {
                         inMemoryRemainingLiters = effectiveSensorLiters
+                        tripStartTankAnchorChecked = true
                         persistedFuelCounterLiters = 0f
                         if (!_state.value.isDemoMode) {
                             settingsRepo.anchorTankToSensor(inMemoryRemainingLiters)
+                            settingsRepo.saveLastStationaryFuelPct(statMed)
                         }
-                        csvLogger?.logEvent("TANK_ANCHORED_START:${String.format(Locale.US, "%.1f", inMemoryRemainingLiters)}L")
-                        if (sensorDelta > 5.0f) {
-                            emitAutoRefuelIfEligible(prevTankLiters, inMemoryRemainingLiters, medPctNow, "TRIP_START", now)
-                        }
+                        csvLogger?.logEvent("TANK_ANCHORED_INIT:${String.format(Locale.US, "%.1f", inMemoryRemainingLiters)}L")
                     }
-                }
 
-                // 3. Stationary refuel with engine running (upward jump > +6.0 L after >= 25s stopped)
-                snap.speedKmh == 0 && stationarySec >= 25.0f && sensorDelta > 6.0f -> {
-                    inMemoryRemainingLiters = effectiveSensorLiters
-                    stationarySec = 0f
-                    persistedFuelCounterLiters = 0f
-                    if (!_state.value.isDemoMode) {
-                        settingsRepo.anchorTankToSensor(inMemoryRemainingLiters)
+                    // 2. Existing calibrated user without stationary baseline yet: initialize baseline quietly
+                    baselinePct <= 0f -> {
+                        if (!_state.value.isDemoMode) {
+                            settingsRepo.saveLastStationaryFuelPct(statMed)
+                        }
+                        if (!tripStartTankAnchorChecked && tripDistanceKm < 0.05f) {
+                            tripStartTankAnchorChecked = true
+                            if (abs(effectiveSensorLiters - inMemoryRemainingLiters) > 6.5f) {
+                                inMemoryRemainingLiters = effectiveSensorLiters
+                                persistedFuelCounterLiters = 0f
+                                if (!_state.value.isDemoMode) {
+                                    settingsRepo.anchorTankToSensor(inMemoryRemainingLiters)
+                                }
+                                csvLogger?.logEvent("TANK_ANCHORED_START:${String.format(Locale.US, "%.1f", inMemoryRemainingLiters)}L")
+                            }
+                        }
                     }
-                    csvLogger?.logEvent("TANK_REFUEL_ENGINE_ON:${String.format(Locale.US, "%.1f", inMemoryRemainingLiters)}L")
-                    emitAutoRefuelIfEligible(prevTankLiters, inMemoryRemainingLiters, medPctNow, "ENGINE_ON", now)
+
+                    // 3. Real refuel detection requires >= 15 stationary samples and >= +15% jump over lastStationaryFuelPct
+                    stationaryFuelSamples.size >= MIN_STATIONARY_REFUEL_SAMPLES -> {
+                        val recent15 = stationaryFuelSamples.takeLast(MIN_STATIONARY_REFUEL_SAMPLES)
+                        val refuelMedian = computeMedian(recent15)
+                        val spread = (recent15.maxOrNull() ?: refuelMedian) - (recent15.minOrNull() ?: refuelMedian)
+                        val pctJump = refuelMedian - baselinePct
+
+                        if (pctJump >= REFUEL_SENSOR_JUMP_PCT && (spread <= 6.0f || stationarySec >= 30.0f)) {
+                            val refuelNewLiters = computeEffectiveSensorLiters(refuelMedian, settings.tankCapacityLiters)
+                            val prevBaselineLiters = computeEffectiveSensorLiters(baselinePct, settings.tankCapacityLiters)
+                            inMemoryRemainingLiters = refuelNewLiters
+                            tripStartTankAnchorChecked = true
+                            persistedFuelCounterLiters = 0f
+                            stationarySec = 0f
+                            if (!_state.value.isDemoMode) {
+                                settingsRepo.anchorTankToSensor(refuelNewLiters)
+                                settingsRepo.saveLastStationaryFuelPct(refuelMedian)
+                            }
+                            csvLogger?.logEvent("TANK_REFUEL_DETECTED:${String.format(Locale.US, "%.1f", refuelNewLiters)}L")
+                            emitAutoRefuelIfEligible(
+                                prevTank = prevBaselineLiters,
+                                newTank = refuelNewLiters,
+                                medPct = refuelMedian,
+                                source = if (tripDistanceKm < 0.05f) "TRIP_START" else "ENGINE_ON",
+                                now = now
+                            )
+                        } else {
+                            if (!tripStartTankAnchorChecked && tripDistanceKm < 0.05f) {
+                                tripStartTankAnchorChecked = true
+                                if (abs(effectiveSensorLiters - inMemoryRemainingLiters) > 6.5f) {
+                                    inMemoryRemainingLiters = effectiveSensorLiters
+                                    persistedFuelCounterLiters = 0f
+                                    if (!_state.value.isDemoMode) {
+                                        settingsRepo.anchorTankToSensor(inMemoryRemainingLiters)
+                                    }
+                                    csvLogger?.logEvent("TANK_ANCHORED_START:${String.format(Locale.US, "%.1f", inMemoryRemainingLiters)}L")
+                                }
+                            }
+                            if (!_state.value.isDemoMode && spread <= 6.0f && pctJump < REFUEL_SENSOR_JUMP_PCT) {
+                                val mafPct = (inMemoryRemainingLiters / settings.tankCapacityLiters) * 100f
+                                if (abs(refuelMedian - mafPct) <= 10.0f) {
+                                    settingsRepo.saveLastStationaryFuelPct(refuelMedian)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -628,23 +730,26 @@ class TelemetryEngine(
             }
 
             // 2. Рух у потоці (up to 40 pts / 100%): Calm city flow reaches 100% after ~5-6 km
+            // Freeze ecoCruiseScore during braking/coasting; only deduct on aggressive throttle surging
             if (snap.speedKmh > 8) {
-                val isCalmCityFlow = snap.throttlePct < 32f &&
-                    abs(deltaThrottlePct) < 6f &&
-                    snap.rpm < 2300 &&
-                    accelKmhPerSec > -3.5f
+                val isBrakingOrCoasting = snap.throttlePct < 16f || accelKmhPerSec < -0.5f
+                if (!isBrakingOrCoasting) {
+                    val isCalmCityFlow = snap.throttlePct < 32f &&
+                        abs(deltaThrottlePct) < 6f &&
+                        snap.rpm < 2300
 
-                if (isCalmCityFlow) {
-                    val deltaMeters = deltaKm * 1000f
-                    val earnPer100m = when {
-                        snap.speedKmh in 40..95 -> 3.8f
-                        snap.speedKmh in 20..40 -> 3.2f
-                        snap.speedKmh in 8..20 -> 2.6f
-                        else -> 2.0f
+                    if (isCalmCityFlow) {
+                        val deltaMeters = deltaKm * 1000f
+                        val earnPer100m = when {
+                            snap.speedKmh in 40..95 -> 3.8f
+                            snap.speedKmh in 20..40 -> 3.2f
+                            snap.speedKmh in 8..20 -> 2.6f
+                            else -> 2.0f
+                        }
+                        ecoCruiseScore = (ecoCruiseScore + (deltaMeters / 100f) * earnPer100m).coerceIn(0f, 100f)
+                    } else if (snap.throttlePct >= 42f || deltaThrottlePct >= 12f) {
+                        ecoCruiseScore = (ecoCruiseScore - dtSec * 1.5f).coerceAtLeast(0f)
                     }
-                    ecoCruiseScore = (ecoCruiseScore + (deltaMeters / 100f) * earnPer100m).coerceIn(0f, 100f)
-                } else if (abs(deltaThrottlePct) > 15f || abs(accelKmhPerSec) > 3.0f) {
-                    ecoCruiseScore = (ecoCruiseScore - dtSec * 1.5f).coerceAtLeast(0f)
                 }
             }
 
@@ -850,7 +955,7 @@ class TelemetryEngine(
         val costUah = (toFullRounded * settings.fuelPriceUah).roundToInt()
         val effectiveAvg = if (avg100Km > 1f) avg100Km else 7.0f
         val rangeKm = ((rem / effectiveAvg) * 100f).roundToInt()
-        val medPct = medianFuelPct
+        val medPct = stationaryMedianPct ?: settingsRepo.lastStationaryFuelPct.value.takeIf { it > 0f } ?: lastDisplayedFuelPct
         val sensorLiters = medPct?.let { computeEffectiveSensorLiters(it, cap) }
 
         return FuelTankInfo(

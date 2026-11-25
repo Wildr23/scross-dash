@@ -25,6 +25,7 @@ data class CsvLogStats(
 interface CsvLogSink {
     fun startSession(): String?
     fun closeSession()
+    fun discardSession()
     fun flush()
     fun getCurrentFileName(): String?
     fun logEvent(eventNote: String)
@@ -146,6 +147,25 @@ class TelemetryCsvLogger(private val context: Context) : CsvLogSink {
             synchronized(this@TelemetryCsvLogger) {
                 closeActiveWriter()
                 activeFile = null
+                updateStats()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun discardSession() {
+        val target = activeFile
+        activeFile = null
+        rowCount = 0
+        unwrittenBufferCount = 0
+        scope.launch {
+            synchronized(this@TelemetryCsvLogger) {
+                closeActiveWriter()
+                try {
+                    if (target != null && target.exists()) {
+                        target.delete()
+                    }
+                } catch (_: Exception) {}
                 updateStats()
             }
         }

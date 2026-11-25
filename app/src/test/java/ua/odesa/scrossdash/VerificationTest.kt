@@ -29,7 +29,8 @@ class VerificationTest {
         initialTankLiters: Float = 32.0f,
         initialCalibrated: Boolean = false,
         initialHeadlightsReminder: Boolean = false,
-        initialOdometerKm: Float = 0f
+        initialOdometerKm: Float = 0f,
+        initialStationaryFuelPct: Float = 0f
     ) : SettingsStore {
         private val _settings = MutableStateFlow(
             AppSettings(
@@ -47,6 +48,9 @@ class VerificationTest {
 
         private val _isTankCalibrated = MutableStateFlow(initialCalibrated)
         override val isTankCalibrated: StateFlow<Boolean> = _isTankCalibrated
+
+        private val _lastStationaryFuelPct = MutableStateFlow(initialStationaryFuelPct)
+        override val lastStationaryFuelPct: StateFlow<Float> = _lastStationaryFuelPct
 
         var anchorCallCount = 0
 
@@ -68,8 +72,13 @@ class VerificationTest {
             _isTankCalibrated.value = true
         }
 
+        override fun saveLastStationaryFuelPct(pct: Float) {
+            _lastStationaryFuelPct.value = pct.coerceIn(0f, 100f)
+        }
+
         override fun markRefueledToFull() {
             anchorTankToSensor(_settings.value.tankCapacityLiters)
+            saveLastStationaryFuelPct(95.0f)
         }
 
         override fun updateOdometerKm(odometerKm: Float) {
@@ -88,6 +97,9 @@ class VerificationTest {
         private val _expenses = MutableStateFlow<List<ExpenseRecord>>(emptyList())
         override val expenses: StateFlow<List<ExpenseRecord>> = _expenses
 
+        private val _pendingRefuel = MutableStateFlow<AutoRefuelEvent?>(null)
+        override val pendingRefuel: StateFlow<AutoRefuelEvent?> = _pendingRefuel
+
         private val consumableList = defaultSCrossConsumables(isWinterSeason = true)
             .mapIndexed { idx, item -> item.copy(id = idx + 1L) }
             .toMutableList()
@@ -96,27 +108,41 @@ class VerificationTest {
 
         private var lastAutoRefuelMs: Long = Long.MIN_VALUE
 
-        override fun recordAutoRefuel(event: AutoRefuelEvent): ExpenseRecord? {
-            if (lastAutoRefuelMs != Long.MIN_VALUE && kotlin.math.abs(event.timestampMs - lastAutoRefuelMs) < ExpenseRepository.AUTO_REFUEL_DEBOUNCE_MS) {
+        override fun recordAutoRefuel(event: AutoRefuelEvent): AutoRefuelEvent? {
+            val latest = listOfNotNull(
+                lastAutoRefuelMs.takeIf { it != Long.MIN_VALUE },
+                _pendingRefuel.value?.timestampMs
+            ).maxOrNull()
+            if (latest != null && kotlin.math.abs(event.timestampMs - latest) < ExpenseRepository.AUTO_REFUEL_DEBOUNCE_MS) {
                 return null
             }
             lastAutoRefuelMs = event.timestampMs
-            val saved = ExpenseRecord(
-                id = nextId++,
-                timestampMs = event.timestampMs,
+            _pendingRefuel.value = event
+            return event
+        }
+
+        override fun confirmPendingRefuel(overrideRecord: ExpenseRecord?) {
+            val pending = _pendingRefuel.value
+            if (pending == null && overrideRecord == null) return
+            val saved = (overrideRecord ?: ExpenseRecord(
+                timestampMs = pending!!.timestampMs,
                 category = ExpenseCategory.FUEL,
-                title = if (event.isFullTank) "Авто-заправка (повний бак)" else "Авто-заправка",
-                amountUah = event.estimatedCostUah,
-                odometerKm = event.odometerKm,
-                liters = event.addedLiters,
-                pricePerLiter = event.pricePerLiterUah,
-                isFullTank = event.isFullTank,
+                title = if (pending.isFullTank) "Авто-заправка (повний бак)" else "Авто-заправка",
+                amountUah = pending.estimatedCostUah,
+                odometerKm = pending.odometerKm,
+                liters = pending.addedLiters,
+                pricePerLiter = pending.pricePerLiterUah,
+                isFullTank = pending.isFullTank,
                 isAutoDetected = true,
-                note = "Автоматично зафіксовано (PID 0x2F)"
-            )
+                note = "Підтверджена авто-заправка (PID 0x2F)"
+            )).copy(id = nextId++, isAutoDetected = true)
+            _pendingRefuel.value = null
             expenseList.add(0, saved)
             _expenses.value = expenseList.toList()
-            return saved
+        }
+
+        override fun dismissPendingRefuel() {
+            _pendingRefuel.value = null
         }
 
         override fun addDistanceToMountedTire(deltaKm: Float) {
@@ -139,6 +165,7 @@ class VerificationTest {
         var upsertCalls = 0
 
         override suspend fun upsertActiveTrip(record: TripRecord): Long {
+            if (record.distanceKm < 0.20f) return 0L
             upsertCalls++
             val existingIdx = if (record.id > 0) {
                 records.indexOfFirst { it.id == record.id }
@@ -158,6 +185,12 @@ class VerificationTest {
             }
         }
 
+        override suspend fun deleteTripById(id: Long) {
+            if (id <= 0L) return
+            records.removeAll { it.id == id }
+            _trips.value = records.toList()
+        }
+
         override suspend fun getLatestTrip(): TripRecord? = records.maxByOrNull { it.startTimeMs }
     }
 
@@ -166,6 +199,7 @@ class VerificationTest {
         var activeFile: String? = null
         val events = mutableListOf<String>()
         var closeCount = 0
+        var discardCount = 0
 
         override fun startSession(): String {
             seq++
@@ -176,6 +210,11 @@ class VerificationTest {
 
         override fun closeSession() {
             closeCount++
+            activeFile = null
+        }
+
+        override fun discardSession() {
+            discardCount++
             activeFile = null
         }
 
@@ -239,7 +278,7 @@ class VerificationTest {
         assertTrue("Expected distance >= 0.5 km", engine.state.value.tripDistanceKm >= 0.5f)
         assertEquals("scross_telemetry_test_1.csv", tripStore.trips.value.first().csvFileName)
 
-        // Traffic-light Start-Stop (RPM == 0, 48V keeps voltage >= 13.0V for 25s) must NOT finalize the trip!
+        // Traffic-light Start-Stop (RPM == 0, 48V DC-DC at 12.4V for 25s) must NOT finalize the trip!
         for (i in 0 until 25) {
             ts += 1000L
             engine.processSnapshot(
@@ -248,18 +287,18 @@ class VerificationTest {
                     speedKmh = 0,
                     coolantTempC = 85,
                     mafGramsPerSec = 0f,
-                    voltage12v = 13.6f,
+                    voltage12v = 12.4f,
                     timestampMs = ts
                 )
             )
         }
-        assertTrue("Start-Stop must NOT finalize or reset trip", engine.state.value.tripDistanceKm >= 0.5f)
+        assertTrue("Start-Stop at 12.4V must NOT finalize or reset trip", engine.state.value.tripDistanceKm >= 0.5f)
         assertTrue("No arrival notification during Start-Stop", finalizedNotifications.isEmpty())
 
-        // Ignition-Off via ECU STANDBY > 8s
-        engine.onEcuSleepTick(3f)
-        engine.onEcuSleepTick(3f)
-        engine.onEcuSleepTick(3f)
+        // Ignition-Off via ECU STANDBY > 12s
+        repeat(5) {
+            engine.onEcuSleepTick(3f)
+        }
 
         assertEquals("Still strictly 1 row after finalization", 1, tripStore.trips.value.size)
         assertEquals("Expected 1 arrival summary notification", 1, finalizedNotifications.size)
@@ -370,8 +409,8 @@ class VerificationTest {
         assertFalse("Must NOT anchor tank while moving", settings.isTankCalibrated.value)
         assertTrue("Tank should remain near 32L via MAF only", engine.state.value.fuelTank.remainingLiters > 31.5f)
 
-        // 2. Come to a stop with median 37% (~17.39L on 47L tank)
-        val stationaryPcts = listOf(36f, 37f, 60f, 38f, 37f, 37f, 37f)
+        // 2. Come to a stop and collect >= 12 stationary samples around median 37% (~17.39L on 47L tank)
+        val stationaryPcts = listOf(36f, 37f, 60f, 38f, 37f, 37f, 37f, 37f, 37f, 37f, 37f, 37f)
         for (pct in stationaryPcts) {
             ts += 1000L
             engine.processSnapshot(
@@ -386,9 +425,10 @@ class VerificationTest {
         }
 
         val expectedLiters = (37f / 100f) * 47.0f
-        assertTrue("Tank must be calibrated when stationary", settings.isTankCalibrated.value)
+        assertTrue("Tank must be calibrated when stationary >= 12 samples", settings.isTankCalibrated.value)
         assertEquals(expectedLiters, engine.state.value.fuelTank.remainingLiters, 0.25f)
         assertEquals(37f, engine.state.value.fuelTank.rawSensorPct ?: 0f, 0.5f)
+        assertEquals(37f, settings.lastStationaryFuelPct.value, 0.5f)
     }
 
     @Test
@@ -407,7 +447,7 @@ class VerificationTest {
         )
 
         var ts = 1_700_000_000_000L
-        for (i in 0 until 3) {
+        for (i in 0 until 12) {
             ts += 1000L
             engine.processSnapshot(
                 RawObdSnapshot(
@@ -427,7 +467,11 @@ class VerificationTest {
 
     @Test
     fun testNoMidTripTankReAnchoringOnSlopedTrafficLights() {
-        val settings = FakeSettingsStore(initialTankLiters = 37.5f, initialCalibrated = true)
+        val settings = FakeSettingsStore(
+            initialTankLiters = 36.7f,
+            initialCalibrated = true,
+            initialStationaryFuelPct = 78.0f
+        )
         val engine = TelemetryEngine(
             settingsRepo = settings,
             solarDarknessProvider = { false },
@@ -435,7 +479,7 @@ class VerificationTest {
         )
 
         var ts = 1_700_000_000_000L
-        // Start driving with matching sensor reading (~80% = 37.6L, no initial jump) past 0.05 km
+        // Start driving with matching sensor reading (~78.0% = 36.7L) past 0.05 km
         for (i in 0 until 20) {
             ts += 1000L
             engine.processSnapshot(
@@ -444,7 +488,7 @@ class VerificationTest {
                     speedKmh = 45, // 20s @ 45 km/h = 0.25 km (> 0.05 km)
                     coolantTempC = 85,
                     mafGramsPerSec = 7.0f,
-                    rawFuelLevelPct = 79.8f,
+                    rawFuelLevelPct = 78.0f,
                     timestampMs = ts
                 )
             )
@@ -452,7 +496,7 @@ class VerificationTest {
         assertEquals("No re-anchor at steady start", 0, settings.anchorCallCount)
         val fuelBeforeStop = engine.state.value.fuelTank.remainingLiters
 
-        // Stop 15 seconds at sloped traffic lights with PID 0x2F swinging wildly between 75.3% (35.4L) and 87.5% (41.1L)
+        // Stop 15 seconds at sloped traffic lights with PID 0x2F swinging wildly between 75.3% and 87.5%
         val trafficLightSwings = listOf(
             75.3f, 75.3f, 76.0f, 87.5f, 87.5f,
             86.0f, 75.8f, 87.5f, 87.5f, 87.5f,
@@ -480,9 +524,13 @@ class VerificationTest {
                 engine.state.value.fuelTank.remainingLiters > fuelBeforeStop - 0.1f
         )
 
-        // Now simulate pulling into a gas station with engine running: stopped >= 25s with upward refuel jump to 94.9% -> 47.0L
-        for (i in 0 until 26) {
-            ts += 1000L
+        // Drive briefly to clear previous sloped stationary buffer, then stop at gas station after filling up to 94.9% (+16.9% over 78.0%)
+        ts += 1000L
+        engine.processSnapshot(
+            RawObdSnapshot(rpm = 1800, speedKmh = 20, coolantTempC = 85, rawFuelLevelPct = 94.9f, timestampMs = ts)
+        )
+        for (i in 0 until 18) {
+            ts += 2000L
             engine.processSnapshot(
                 RawObdSnapshot(
                     rpm = 750,
@@ -494,7 +542,7 @@ class VerificationTest {
                 )
             )
         }
-        assertEquals("Stationary engine-on refuel >= 25s must re-anchor to 47L", 1, settings.anchorCallCount)
+        assertEquals("Stationary engine-on refuel >= 15 samples & >= +15% must re-anchor to 47L", 1, settings.anchorCallCount)
         assertEquals(47.0f, engine.state.value.fuelTank.remainingLiters, 0.05f)
     }
 
@@ -758,9 +806,10 @@ class VerificationTest {
     @Test
     fun testZeroTouchAutoRefuelDetectionAndDebounce() {
         val settings = FakeSettingsStore(
-            initialTankLiters = 32.0f,
-            initialCalibrated = false,
-            initialOdometerKm = 14_250f
+            initialTankLiters = 30.5f,
+            initialCalibrated = true,
+            initialOdometerKm = 14_250f,
+            initialStationaryFuelPct = 74.5f // Real previous stationary baseline despite drifted 30.5L MAF estimate
         )
         val expenseStore = FakeExpenseStore()
         val emittedEvents = mutableListOf<AutoRefuelEvent>()
@@ -775,24 +824,68 @@ class VerificationTest {
         engine.updateConnectionStatus(connected = true, demo = false, message = "Connected")
 
         var ts = 1_700_000_000_000L
-        // 1. Initial uncalibrated anchor (~25 L) MUST NOT create an auto-refuel expense
-        engine.processSnapshot(
-            RawObdSnapshot(
-                rpm = 750,
-                speedKmh = 0,
-                coolantTempC = 85,
-                voltage12v = 14.1f,
-                rawFuelLevelPct = 53.2f,
-                timestampMs = ts
+        // 1. Moving PID 0x2F fluctuations (even 85.1% -> 40.0L vs 30.5L drifted) MUST NOT trigger TANK_ANCHORED_START or auto-refuel
+        for (i in 0 until 15) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 1600,
+                    speedKmh = 38,
+                    coolantTempC = 65,
+                    mafGramsPerSec = 6.5f,
+                    voltage12v = 14.1f,
+                    rawFuelLevelPct = 85.1f,
+                    timestampMs = ts
+                )
             )
-        )
-        assertTrue(settings.isTankCalibrated.value)
-        assertEquals(0, expenseStore.expenses.value.size)
+        }
+        assertEquals(0, settings.anchorCallCount)
+        assertNull(expenseStore.pendingRefuel.value)
+        assertTrue(expenseStore.expenses.value.isEmpty())
         assertEquals(0, emittedEvents.size)
 
-        // 2. Next ignition/trip start after filling to nozzle click (>= 93% -> 47.0 L) emits full-tank expense
+        // 2. Come to a stop at real fuel level 75.5% (within +1% of 74.5% stationary baseline) -> anchors quietly, NO phantom refuel!
         engine.resetTrip()
-        ts += 60_000L
+        for (i in 0 until 16) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    coolantTempC = 75,
+                    voltage12v = 14.1f,
+                    rawFuelLevelPct = 75.5f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertNull("Normal +-1% stationary reading must NOT trigger phantom refuel", expenseStore.pendingRefuel.value)
+        assertEquals(0, emittedEvents.size)
+
+        // 3. Real refuel: drop baseline to 50.0% cleanly, then fill to 94.9% (+44.9% >= +15%)
+        settings.saveLastStationaryFuelPct(50.0f)
+        settings.anchorTankToSensor(23.5f)
+        engine.resetTrip()
+
+        // Only 14 stationary samples must NOT emit auto-refuel yet (requires >= 15)
+        for (i in 0 until 14) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    coolantTempC = 82,
+                    voltage12v = 14.1f,
+                    rawFuelLevelPct = 94.9f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertNull("Must wait for >= 15 stationary samples", expenseStore.pendingRefuel.value)
+        assertEquals(0, emittedEvents.size)
+
+        // 15th stationary sample emits PENDING refuel — expenses table must remain untouched until user confirms!
+        ts += 1000L
         engine.processSnapshot(
             RawObdSnapshot(
                 rpm = 750,
@@ -803,94 +896,77 @@ class VerificationTest {
                 timestampMs = ts
             )
         )
-        assertEquals(1, expenseStore.expenses.value.size)
+        assertNotNull("15th stationary sample with >= +15% jump creates pending refuel", expenseStore.pendingRefuel.value)
         assertEquals(1, emittedEvents.size)
         assertTrue(emittedEvents[0].isFullTank)
         assertTrue(emittedEvents[0].addedLiters > 20f)
-        assertEquals(14_250f, expenseStore.expenses.value[0].odometerKm, 0.1f)
+        assertEquals("Auto-refuel must NOT silently pollute expenses", 0, expenseStore.expenses.value.size)
+
+        // User confirms pending refuel -> now 1 confirmed expense exists in Витрати
+        expenseStore.confirmPendingRefuel()
+        assertNull(expenseStore.pendingRefuel.value)
+        assertEquals(1, expenseStore.expenses.value.size)
+        assertEquals(settings.settings.value.odometerKm, expenseStore.expenses.value[0].odometerKm, 0.05f)
+        assertTrue(expenseStore.expenses.value[0].odometerKm >= 14_250f)
         assertTrue(expenseStore.expenses.value[0].isAutoDetected)
 
-        // 3. Downward slosh / drop must NOT emit expense, and upward jump inside 10 min must be debounced
+        // 4. Jump inside 10-minute debounce must be ignored
+        settings.saveLastStationaryFuelPct(50.0f)
+        settings.anchorTankToSensor(23.5f)
         engine.resetTrip()
-        ts += 60_000L
-        engine.processSnapshot(
-            RawObdSnapshot(
-                rpm = 750,
-                speedKmh = 0,
-                coolantTempC = 85,
-                voltage12v = 14.1f,
-                rawFuelLevelPct = 60.0f, // anchors down to ~28.2 L
-                timestampMs = ts
-            )
-        )
-        assertEquals(1, expenseStore.expenses.value.size)
-
-        engine.resetTrip()
-        ts += 60_000L // only 2 min after first auto-refuel (< 10 min debounce)
-        engine.processSnapshot(
-            RawObdSnapshot(
-                rpm = 750,
-                speedKmh = 0,
-                coolantTempC = 85,
-                voltage12v = 14.1f,
-                rawFuelLevelPct = 94.9f,
-                timestampMs = ts
-            )
-        )
-        assertEquals("Jump inside 10-minute debounce must be ignored", 1, expenseStore.expenses.value.size)
-
-        // 4. After > 10 minutes, stationary engine-on refuel emits a second expense
-        engine.resetTrip()
-        ts += 700_000L // > 11 minutes later
-        engine.processSnapshot(
-            RawObdSnapshot(
-                rpm = 750,
-                speedKmh = 0,
-                coolantTempC = 85,
-                voltage12v = 14.1f,
-                rawFuelLevelPct = 60.0f, // ~28.2 L
-                timestampMs = ts
-            )
-        )
-        // Drive briefly so tripStartTankAnchorChecked becomes true
-        ts += 2000L
-        engine.processSnapshot(
-            RawObdSnapshot(
-                rpm = 1800,
-                speedKmh = 30,
-                coolantTempC = 86,
-                voltage12v = 14.2f,
-                rawFuelLevelPct = 60.0f,
-                timestampMs = ts
-            )
-        )
-        // Now stop with engine running >= 25 seconds after filling up to 94.9%
-        for (i in 0 until 15) {
-            ts += 2500L
+        ts += 60_000L // within 10 min
+        for (i in 0 until 16) {
+            ts += 1000L
             engine.processSnapshot(
                 RawObdSnapshot(
                     rpm = 750,
                     speedKmh = 0,
-                    coolantTempC = 86,
+                    coolantTempC = 85,
                     voltage12v = 14.1f,
                     rawFuelLevelPct = 94.9f,
                     timestampMs = ts
                 )
             )
         }
-        assertEquals(2, expenseStore.expenses.value.size)
-        assertEquals(2, emittedEvents.size)
+        assertNull("Jump inside 10-minute debounce must be ignored", expenseStore.pendingRefuel.value)
+        assertEquals(1, expenseStore.expenses.value.size)
 
-        // 5. Demo mode must never emit expenses
+        // 5. After > 10 minutes, refuel stages a new pending refuel; dismissing discards without saving
+        settings.saveLastStationaryFuelPct(50.0f)
+        settings.anchorTankToSensor(23.5f)
+        engine.resetTrip()
+        ts += 700_000L
+        for (i in 0 until 16) {
+            ts += 2000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 750,
+                    speedKmh = 0,
+                    coolantTempC = 85,
+                    voltage12v = 14.1f,
+                    rawFuelLevelPct = 94.9f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertNotNull(expenseStore.pendingRefuel.value)
+        assertEquals(2, emittedEvents.size)
+        expenseStore.dismissPendingRefuel()
+        assertNull(expenseStore.pendingRefuel.value)
+        assertEquals("Dismissed pending refuel must NOT add to expenses", 1, expenseStore.expenses.value.size)
+
+        // 6. Demo mode must never emit expenses or pending refuel
         settings.setDemoMode(true)
+        settings.saveLastStationaryFuelPct(40.0f)
         engine.updateConnectionStatus(connected = true, demo = true, message = "Demo")
         engine.resetTrip()
         ts += 700_000L
-        engine.processSnapshot(RawObdSnapshot(rpm = 750, speedKmh = 0, rawFuelLevelPct = 50.0f, timestampMs = ts))
-        engine.resetTrip()
-        ts += 5_000L
-        engine.processSnapshot(RawObdSnapshot(rpm = 750, speedKmh = 0, rawFuelLevelPct = 94.9f, timestampMs = ts))
-        assertEquals(2, expenseStore.expenses.value.size)
+        for (i in 0 until 16) {
+            ts += 1000L
+            engine.processSnapshot(RawObdSnapshot(rpm = 750, speedKmh = 0, rawFuelLevelPct = 94.9f, timestampMs = ts))
+        }
+        assertNull(expenseStore.pendingRefuel.value)
+        assertEquals(1, expenseStore.expenses.value.size)
     }
 
     @Test
@@ -1105,5 +1181,162 @@ class VerificationTest {
 
         val consumablesCsv = buildConsumablesCsv(defaultSCrossConsumables(), 10_500f)
         assertTrue(consumablesCsv.contains("Моторна олива + фільтр (K14D)"))
+    }
+
+    // ──────── 2026-11-25 Road-Test Bugfix Verification Tests ────────
+
+    @Test
+    fun testAaDisconnectResilienceStartStopLowVoltAndMicroStubDiscard() {
+        val settings = FakeSettingsStore(initialTankLiters = 38.0f, initialCalibrated = true)
+        val tripStore = FakeTripStore()
+        val csvSink = FakeCsvSink()
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            tripRepo = tripStore,
+            csvLogger = csvSink,
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+        engine.updateConnectionStatus(connected = true, demo = false, message = "Connected")
+        engine.setAndroidAutoProjectionActive(true)
+
+        var ts = 1_700_000_000_000L
+        // 1. Micro-stub < 0.20 km (0.14 km) finalized -> must NOT be saved to Archive and CSV must be discarded
+        for (i in 0 until 10) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(rpm = 1600, speedKmh = 50, mafGramsPerSec = 7.0f, voltage12v = 14.1f, timestampMs = ts)
+            )
+        }
+        assertTrue(engine.state.value.tripDistanceKm in 0.10f..0.19f)
+        repeat(5) { engine.onEcuSleepTick(3f) }
+        assertTrue("Micro-trips < 0.20 km must NEVER enter Archive", tripStore.trips.value.isEmpty())
+        assertTrue("Stub CSV must be discarded", csvSink.discardCount >= 1)
+
+        // 2. Real drive (~0.6 km) + Start-Stop at 12.36V + brief AA projection drop while ECU awake
+        for (i in 0 until 40) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(rpm = 1800, speedKmh = 54, mafGramsPerSec = 8.0f, voltage12v = 14.1f, timestampMs = ts)
+            )
+        }
+        val distBeforeGlitch = engine.state.value.tripDistanceKm
+        assertTrue(distBeforeGlitch >= 0.55f)
+
+        // Brief AA projection end while ECU is awake (e.g. AAWireless / phone switch)
+        engine.setAndroidAutoProjectionActive(false)
+        assertTrue("ECU must remain marked awake & trip active across AA drop", engine.isObdConnectedAndAwake())
+        assertTrue(engine.isTripActiveNow())
+
+        // Start-Stop / cruising at 12.36V with RPM == 0 for 30s -> must NOT trigger cutoff
+        for (i in 0 until 30) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(rpm = 0, speedKmh = 0, coolantTempC = 88, voltage12v = 12.36f, timestampMs = ts)
+            )
+        }
+        assertTrue("Trip must survive 30s Start-Stop at 12.36V", engine.isTripActiveNow())
+        assertEquals(distBeforeGlitch, engine.state.value.tripDistanceKm, 0.01f)
+
+        // Resume driving seamlessly + AA reconnects -> same single trip continues
+        engine.setAndroidAutoProjectionActive(true)
+        for (i in 0 until 20) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(rpm = 1800, speedKmh = 54, mafGramsPerSec = 8.0f, voltage12v = 12.56f, timestampMs = ts)
+            )
+        }
+        assertTrue("Trip distance must continue seamlessly after AA reconnect", engine.state.value.tripDistanceKm > distBeforeGlitch + 0.25f)
+
+        // 3. Real OBD disconnect timeout > 60s when AA is also disconnected finalizes cleanly into 1 row
+        engine.setAndroidAutoProjectionActive(false)
+        engine.onDisconnect(ts)
+        assertFalse("Must NOT finalize immediately on disconnect (< 60s)", engine.checkDisconnectedTimeout(ts + 30_000L))
+        assertTrue(engine.isTripActiveNow())
+        assertTrue("Must finalize after > 60s OBD+AA disconnect", engine.checkDisconnectedTimeout(ts + 65_000L))
+        assertEquals("Entire drive must stay 1 single row in Archive", 1, tripStore.trips.value.size)
+        assertFalse(engine.isTripActiveNow())
+
+        // 4. Continuous RPM == 0 for > 180s also finalizes cleanly
+        for (i in 0 until 30) {
+            ts += 1000L
+            engine.processSnapshot(RawObdSnapshot(rpm = 1800, speedKmh = 54, mafGramsPerSec = 8.0f, timestampMs = ts))
+        }
+        assertTrue(engine.isTripActiveNow())
+        for (i in 0 until 190) {
+            ts += 1000L
+            engine.processSnapshot(RawObdSnapshot(rpm = 0, speedKmh = 0, coolantTempC = 88, voltage12v = 12.50f, timestampMs = ts))
+        }
+        assertFalse("Trip must finalize after > 180s continuous RPM == 0", engine.isTripActiveNow())
+        assertEquals(2, tripStore.trips.value.size)
+    }
+
+    @Test
+    fun testEcoCruiseFrozenDuringBrakingAndPenalizedOnlyOnAggressiveSurging() {
+        val settings = FakeSettingsStore(initialTankLiters = 35f, initialCalibrated = true)
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+
+        var ts = 1_700_000_000_000L
+        // Build ecoCruiseScore in calm flow (45 km/h, throttle 22%, rpm 1800)
+        for (i in 0 until 45) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 1800,
+                    speedKmh = 45,
+                    throttlePct = 22f,
+                    mafGramsPerSec = 7.5f,
+                    coolantTempC = 85,
+                    timestampMs = ts
+                )
+            )
+        }
+        val cruiseBeforeBrake = engine.state.value.eco.speedSteadiness
+        assertTrue("Expected ecoCruiseScore > 12 in calm flow, got $cruiseBeforeBrake", cruiseBeforeBrake > 12)
+
+        // Simulate realistic braking to traffic light: throttle 13%, speed dropping 5 km/h per second (accel = -5.0 km/h/s)
+        var speed = 45
+        for (i in 0 until 6) {
+            ts += 1000L
+            speed = (speed - 5).coerceAtLeast(10)
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 1200,
+                    speedKmh = speed,
+                    throttlePct = 13f,
+                    mafGramsPerSec = 1.5f,
+                    coolantTempC = 85,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertEquals(
+            "Normal braking/coasting must NEVER penalize ecoCruiseScore",
+            cruiseBeforeBrake,
+            engine.state.value.eco.speedSteadiness
+        )
+
+        // Aggressive throttle surging (>= 42%) DOES penalize ecoCruiseScore
+        for (i in 0 until 6) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 3400,
+                    speedKmh = 55,
+                    throttlePct = 52f,
+                    mafGramsPerSec = 25f,
+                    coolantTempC = 85,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertTrue(
+            "Aggressive throttle (>= 42%) should deduct from ecoCruiseScore",
+            engine.state.value.eco.speedSteadiness < cruiseBeforeBrake
+        )
     }
 }

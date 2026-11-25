@@ -34,6 +34,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import ua.odesa.scrossdash.data.db.AutoRefuelEvent
 import ua.odesa.scrossdash.data.db.ConsumableItem
 import ua.odesa.scrossdash.data.db.ExpenseRecord
 import ua.odesa.scrossdash.data.db.TripRecord
@@ -52,6 +53,7 @@ fun PhoneDashboardScreen(
     trips: List<TripRecord> = emptyList(),
     expenses: List<ExpenseRecord> = emptyList(),
     consumables: List<ConsumableItem> = emptyList(),
+    pendingRefuel: AutoRefuelEvent? = null,
     csvStats: CsvLogStats = CsvLogStats(),
     initialTab: Int = 0,
     tabTriggerKey: Int = 0,
@@ -75,6 +77,9 @@ fun PhoneDashboardScreen(
     onThemeModeChanged: (String) -> Unit = {},
     onHeadlightsReminderChanged: (Boolean) -> Unit = {},
     onUpdateOdometer: (Float) -> Unit = {},
+    onConfirmPendingRefuel: () -> Unit = {},
+    onConfirmPendingRefuelEdited: (ExpenseRecord) -> Unit = {},
+    onDismissPendingRefuel: () -> Unit = {},
     onAddExpense: (ExpenseRecord, Long?) -> Unit = { _, _ -> },
     onUpdateExpense: (ExpenseRecord) -> Unit = {},
     onDeleteExpense: (Long) -> Unit = {},
@@ -219,6 +224,10 @@ fun PhoneDashboardScreen(
                     trips = trips,
                     currentOdometerKm = settings.odometerKm,
                     defaultFuelPriceUah = settings.fuelPriceUah,
+                    pendingRefuel = pendingRefuel,
+                    onConfirmPendingRefuel = onConfirmPendingRefuel,
+                    onConfirmPendingRefuelEdited = onConfirmPendingRefuelEdited,
+                    onDismissPendingRefuel = onDismissPendingRefuel,
                     onUpdateOdometer = onUpdateOdometer,
                     onAddExpense = onAddExpense,
                     onUpdateExpense = onUpdateExpense,

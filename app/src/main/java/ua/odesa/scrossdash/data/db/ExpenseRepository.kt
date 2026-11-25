@@ -1,5 +1,6 @@
 package ua.odesa.scrossdash.data.db
 
+import android.content.SharedPreferences
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -14,17 +15,31 @@ import kotlin.math.abs
 interface ExpenseStore {
     val expenses: StateFlow<List<ExpenseRecord>>
     val consumables: StateFlow<List<ConsumableItem>>
-    fun recordAutoRefuel(event: AutoRefuelEvent): ExpenseRecord?
+    val pendingRefuel: StateFlow<AutoRefuelEvent?>
+    fun recordAutoRefuel(event: AutoRefuelEvent): AutoRefuelEvent?
+    fun confirmPendingRefuel(overrideRecord: ExpenseRecord? = null)
+    fun dismissPendingRefuel()
     fun addDistanceToMountedTire(deltaKm: Float)
 }
 
 class ExpenseRepository(
     private val dbHelper: TripDatabaseHelper,
-    isWinterSeason: Boolean = defaultIsWinterSeason()
+    isWinterSeason: Boolean = defaultIsWinterSeason(),
+    private val prefs: SharedPreferences? = null
 ) : ExpenseStore {
 
     companion object {
         const val AUTO_REFUEL_DEBOUNCE_MS = 10L * 60L * 1000L
+
+        private const val KEY_HAS_PENDING = "has_pending"
+        private const val KEY_TS = "ts"
+        private const val KEY_ADDED_LITERS = "added_liters"
+        private const val KEY_NEW_TANK_LITERS = "new_tank_liters"
+        private const val KEY_PRICE_PER_LITER = "price_per_liter"
+        private const val KEY_ESTIMATED_COST = "estimated_cost"
+        private const val KEY_IS_FULL_TANK = "is_full_tank"
+        private const val KEY_ODOMETER_KM = "odometer_km"
+        private const val KEY_SOURCE = "source"
 
         fun defaultIsWinterSeason(): Boolean {
             val month = Calendar.getInstance().get(Calendar.MONTH)
@@ -43,6 +58,9 @@ class ExpenseRepository(
     private val _consumables = MutableStateFlow<List<ConsumableItem>>(emptyList())
     override val consumables: StateFlow<List<ConsumableItem>> = _consumables.asStateFlow()
 
+    private val _pendingRefuel = MutableStateFlow(loadPendingFromPrefs())
+    override val pendingRefuel: StateFlow<AutoRefuelEvent?> = _pendingRefuel.asStateFlow()
+
     @Volatile
     private var lastAutoRefuelMs: Long = Long.MIN_VALUE
 
@@ -54,6 +72,42 @@ class ExpenseRepository(
         }
     }
 
+    private fun loadPendingFromPrefs(): AutoRefuelEvent? {
+        val p = prefs ?: return null
+        if (!p.getBoolean(KEY_HAS_PENDING, false)) return null
+        val ts = p.getLong(KEY_TS, 0L)
+        if (ts <= 0L) return null
+        return AutoRefuelEvent(
+            timestampMs = ts,
+            addedLiters = p.getFloat(KEY_ADDED_LITERS, 0f),
+            newTankLiters = p.getFloat(KEY_NEW_TANK_LITERS, 0f),
+            pricePerLiterUah = p.getFloat(KEY_PRICE_PER_LITER, 0f),
+            estimatedCostUah = p.getFloat(KEY_ESTIMATED_COST, 0f),
+            isFullTank = p.getBoolean(KEY_IS_FULL_TANK, false),
+            odometerKm = p.getFloat(KEY_ODOMETER_KM, 0f),
+            source = p.getString(KEY_SOURCE, "STATIONARY") ?: "STATIONARY"
+        )
+    }
+
+    private fun savePendingToPrefs(event: AutoRefuelEvent?) {
+        val editor = prefs?.edit() ?: return
+        if (event == null) {
+            editor.putBoolean(KEY_HAS_PENDING, false).apply()
+        } else {
+            editor
+                .putBoolean(KEY_HAS_PENDING, true)
+                .putLong(KEY_TS, event.timestampMs)
+                .putFloat(KEY_ADDED_LITERS, event.addedLiters)
+                .putFloat(KEY_NEW_TANK_LITERS, event.newTankLiters)
+                .putFloat(KEY_PRICE_PER_LITER, event.pricePerLiterUah)
+                .putFloat(KEY_ESTIMATED_COST, event.estimatedCostUah)
+                .putBoolean(KEY_IS_FULL_TANK, event.isFullTank)
+                .putFloat(KEY_ODOMETER_KM, event.odometerKm)
+                .putString(KEY_SOURCE, event.source)
+                .apply()
+        }
+    }
+
     fun reloadAll() {
         scope.launch {
             _expenses.value = dbHelper.getAllExpenses()
@@ -61,11 +115,17 @@ class ExpenseRepository(
         }
     }
 
+    /**
+     * Stages a detected refuel as a pending/unconfirmed prompt (10-minute debounced),
+     * NEVER writing directly to SQLite expenses without explicit user confirmation.
+     */
     @Synchronized
-    override fun recordAutoRefuel(event: AutoRefuelEvent): ExpenseRecord? {
+    override fun recordAutoRefuel(event: AutoRefuelEvent): AutoRefuelEvent? {
         val dbLatestMs = dbHelper.getLatestAutoFuelExpenseTimeMs()
+        val pendingLatestMs = _pendingRefuel.value?.timestampMs
         val latestMs = listOfNotNull(
             lastAutoRefuelMs.takeIf { it != Long.MIN_VALUE },
+            pendingLatestMs,
             dbLatestMs
         ).maxOrNull()
 
@@ -74,22 +134,51 @@ class ExpenseRepository(
         }
 
         lastAutoRefuelMs = event.timestampMs
-        val record = ExpenseRecord(
-            timestampMs = event.timestampMs,
-            category = ExpenseCategory.FUEL,
-            title = if (event.isFullTank) "Авто-заправка (повний бак)" else "Авто-заправка",
-            amountUah = event.estimatedCostUah,
-            odometerKm = event.odometerKm,
-            liters = event.addedLiters,
-            pricePerLiter = event.pricePerLiterUah,
-            isFullTank = event.isFullTank,
-            isAutoDetected = true,
-            linkedItemId = null,
-            note = "Автоматично зафіксовано (PID 0x2F)"
-        )
-        val assignedId = dbHelper.insertExpense(record)
-        _expenses.value = dbHelper.getAllExpenses()
-        return record.copy(id = assignedId)
+        _pendingRefuel.value = event
+        savePendingToPrefs(event)
+        return event
+    }
+
+    @Synchronized
+    override fun confirmPendingRefuel(overrideRecord: ExpenseRecord?) {
+        val pending = _pendingRefuel.value
+        if (pending == null && overrideRecord == null) return
+
+        val recordToSave = if (overrideRecord != null) {
+            overrideRecord.copy(
+                id = 0L,
+                isAutoDetected = true,
+                category = ExpenseCategory.FUEL
+            )
+        } else {
+            val ev = pending!!
+            ExpenseRecord(
+                timestampMs = ev.timestampMs,
+                category = ExpenseCategory.FUEL,
+                title = if (ev.isFullTank) "Авто-заправка (повний бак)" else "Авто-заправка",
+                amountUah = ev.estimatedCostUah,
+                odometerKm = ev.odometerKm,
+                liters = ev.addedLiters,
+                pricePerLiter = ev.pricePerLiterUah,
+                isFullTank = ev.isFullTank,
+                isAutoDetected = true,
+                linkedItemId = null,
+                note = "Підтверджена авто-заправка (PID 0x2F)"
+            )
+        }
+
+        _pendingRefuel.value = null
+        savePendingToPrefs(null)
+        scope.launch {
+            dbHelper.insertExpense(recordToSave)
+            _expenses.value = dbHelper.getAllExpenses()
+        }
+    }
+
+    @Synchronized
+    override fun dismissPendingRefuel() {
+        _pendingRefuel.value = null
+        savePendingToPrefs(null)
     }
 
     override fun addDistanceToMountedTire(deltaKm: Float) {

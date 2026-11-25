@@ -23,12 +23,17 @@ class ObdTelemetryService : Service() {
         const val CHANNEL_ID = "scross_telemetry_channel"
         const val ACTION_CAR_BT_CONNECTED = "ua.odesa.scrossdash.action.CAR_BT_CONNECTED"
         const val ACTION_CAR_BT_DISCONNECTED = "ua.odesa.scrossdash.action.CAR_BT_DISCONNECTED"
+
+        @Volatile
+        var isRunning: Boolean = false
+            private set
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var carConnection: CarConnection? = null
     private var isProjectionActive = false
     private var idleTimeoutJob: Job? = null
+    private var disconnectWatchdogJob: Job? = null
 
     private val carConnectionObserver = Observer<Int> { connectionType ->
         when (connectionType) {
@@ -45,6 +50,7 @@ class ObdTelemetryService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         createNotificationChannel()
 
         // Start in foreground immediately to satisfy Android foreground service requirements
@@ -84,7 +90,8 @@ class ObdTelemetryService : Service() {
         idleTimeoutJob?.cancel()
         idleTimeoutJob = serviceScope.launch {
             delay(20_000L) // 20 seconds
-            if (!isProjectionActive) {
+            val app = application as SCrossApplication
+            if (!isProjectionActive && !app.telemetryEngine.isTripActiveNow() && !app.telemetryEngine.isObdConnectedAndAwake()) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
@@ -95,8 +102,11 @@ class ObdTelemetryService : Service() {
         isProjectionActive = true
         idleTimeoutJob?.cancel()
         idleTimeoutJob = null
+        disconnectWatchdogJob?.cancel()
+        disconnectWatchdogJob = null
 
         val app = application as SCrossApplication
+        app.telemetryEngine.setAndroidAutoProjectionActive(true)
         app.obdManager.start()
 
         val notificationManager = getSystemService(NotificationManager::class.java)
@@ -111,10 +121,52 @@ class ObdTelemetryService : Service() {
         idleTimeoutJob?.cancel()
 
         val app = application as SCrossApplication
-        app.telemetryEngine.finalizeAndArchiveTrip(
-            postSummaryNotification = true,
-            reason = "AA_PROJECTION_ENDED"
-        )
+        app.telemetryEngine.setAndroidAutoProjectionActive(false)
+
+        if (app.telemetryEngine.isObdConnectedAndAwake() || app.telemetryEngine.isTripActiveNow()) {
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager?.notify(
+                NOTIFICATION_ID,
+                buildNotification("S-Cross 48V: фоновий запис поїздки (OBDII)")
+            )
+            startDisconnectWatchdog()
+        } else {
+            shutdownServiceCleanly()
+        }
+    }
+
+    private fun startDisconnectWatchdog() {
+        disconnectWatchdogJob?.cancel()
+        disconnectWatchdogJob = serviceScope.launch {
+            val app = application as SCrossApplication
+            var idleAfterFinishSec = 0
+            while (isActive && !isProjectionActive) {
+                delay(5_000L)
+                if (isProjectionActive) break
+                if (app.telemetryEngine.checkDisconnectedTimeout()) {
+                    shutdownServiceCleanly()
+                    break
+                }
+                if (!app.telemetryEngine.isTripActiveNow() && !app.telemetryEngine.isObdConnectedAndAwake()) {
+                    idleAfterFinishSec += 5
+                    if (idleAfterFinishSec >= 15) {
+                        shutdownServiceCleanly()
+                        break
+                    }
+                } else {
+                    idleAfterFinishSec = 0
+                }
+            }
+        }
+    }
+
+    private fun shutdownServiceCleanly() {
+        disconnectWatchdogJob?.cancel()
+        disconnectWatchdogJob = null
+        idleTimeoutJob?.cancel()
+        idleTimeoutJob = null
+
+        val app = application as SCrossApplication
         app.csvLogger.flush()
         app.obdManager.stop()
 
@@ -157,7 +209,9 @@ class ObdTelemetryService : Service() {
     }
 
     override fun onDestroy() {
+        isRunning = false
         idleTimeoutJob?.cancel()
+        disconnectWatchdogJob?.cancel()
         carConnection?.type?.removeObserver(carConnectionObserver)
         serviceScope.cancel()
         super.onDestroy()

@@ -56,6 +56,11 @@ class SettingsRepository(context: Context) : SettingsStore {
             rawMaf
         }
 
+        val hasParkingPin = prefs.getBoolean("has_parking_pin", false)
+        val parkingLat = if (hasParkingPin) Double.fromBits(prefs.getLong("parking_lat_bits", 0L)) else null
+        val parkingLng = if (hasParkingPin) Double.fromBits(prefs.getLong("parking_lng_bits", 0L)) else null
+        val parkingTs = if (hasParkingPin) prefs.getLong("parking_timestamp_ms", 0L) else 0L
+
         return AppSettings(
             selectedDeviceMac = prefs.getString("device_mac", "") ?: "",
             selectedDeviceName = prefs.getString("device_name", "OBDII") ?: "OBDII",
@@ -65,7 +70,51 @@ class SettingsRepository(context: Context) : SettingsStore {
             demoMode = prefs.getBoolean("demo_mode", false),
             themeMode = prefs.getString("theme_mode", "AUTO") ?: "AUTO",
             headlightsReminderEnabled = prefs.getBoolean("headlights_reminder_enabled", false),
-            odometerKm = prefs.getFloat("odometer_km", 0f).coerceAtLeast(0f)
+            odometerKm = prefs.getFloat("odometer_km", 0f).coerceAtLeast(0f),
+            washReminderDays = prefs.getInt("wash_reminder_days", 14).coerceIn(3, 90),
+            autoParkingEnabled = prefs.getBoolean("auto_parking_enabled", true),
+            parkingLat = parkingLat,
+            parkingLng = parkingLng,
+            parkingTimestampMs = parkingTs
+        )
+    }
+
+    fun updateWashReminderDays(days: Int) {
+        val safeDays = days.coerceIn(3, 90)
+        prefs.edit().putInt("wash_reminder_days", safeDays).apply()
+        _settings.value = _settings.value.copy(washReminderDays = safeDays)
+    }
+
+    fun setAutoParkingEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("auto_parking_enabled", enabled).apply()
+        _settings.value = _settings.value.copy(autoParkingEnabled = enabled)
+    }
+
+    fun saveParkingLocation(lat: Double, lng: Double, timestampMs: Long = System.currentTimeMillis()) {
+        prefs.edit()
+            .putBoolean("has_parking_pin", true)
+            .putLong("parking_lat_bits", lat.toRawBits())
+            .putLong("parking_lng_bits", lng.toRawBits())
+            .putLong("parking_timestamp_ms", timestampMs)
+            .apply()
+        _settings.value = _settings.value.copy(
+            parkingLat = lat,
+            parkingLng = lng,
+            parkingTimestampMs = timestampMs
+        )
+    }
+
+    fun clearParkingLocation() {
+        prefs.edit()
+            .putBoolean("has_parking_pin", false)
+            .remove("parking_lat_bits")
+            .remove("parking_lng_bits")
+            .remove("parking_timestamp_ms")
+            .apply()
+        _settings.value = _settings.value.copy(
+            parkingLat = null,
+            parkingLng = null,
+            parkingTimestampMs = 0L
         )
     }
 

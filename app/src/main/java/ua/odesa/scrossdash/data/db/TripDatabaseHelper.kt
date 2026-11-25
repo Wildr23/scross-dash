@@ -542,4 +542,99 @@ class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_
             arrayOf<Any>(deltaKm)
         )
     }
+
+    // ──────── Deduplicated 1-Click ZIP Backup Restore ────────
+
+    @Synchronized
+    fun restoreTrips(trips: List<TripRecord>): Int {
+        if (trips.isEmpty()) return 0
+        val db = writableDatabase
+        var inserted = 0
+        db.beginTransaction()
+        try {
+            for (trip in trips) {
+                if (findTripIdByStartTime(db, trip.startTimeMs) == null) {
+                    db.insert(TABLE_TRIPS, null, toContentValues(trip, includeStartTime = true))
+                    inserted++
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return inserted
+    }
+
+    @Synchronized
+    fun restoreExpenses(expenses: List<ExpenseRecord>): Int {
+        if (expenses.isEmpty()) return 0
+        val db = writableDatabase
+        val existingKeys = getAllExpenses().mapTo(HashSet()) { expenseDedupKey(it) }
+        var inserted = 0
+        db.beginTransaction()
+        try {
+            for (expense in expenses) {
+                val key = expenseDedupKey(expense)
+                if (existingKeys.add(key)) {
+                    db.insert(TABLE_EXPENSES, null, toExpenseContentValues(expense))
+                    inserted++
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return inserted
+    }
+
+    @Synchronized
+    fun restoreConsumables(items: List<ConsumableItem>): Int {
+        if (items.isEmpty()) return 0
+        val db = writableDatabase
+        val existing = getAllConsumables()
+        var restored = 0
+        db.beginTransaction()
+        try {
+            for (incoming in items) {
+                val match = existing.firstOrNull { ex ->
+                    ex.name.trim().equals(incoming.name.trim(), ignoreCase = true) &&
+                        ex.isTireSet == incoming.isTireSet &&
+                        ex.tireSeason == incoming.tireSeason
+                }
+                if (match == null) {
+                    db.insert(TABLE_CONSUMABLES, null, toConsumableContentValues(incoming))
+                    restored++
+                } else {
+                    val hasNewerService = incoming.lastDoneTimeMs > match.lastDoneTimeMs
+                    val hasHigherTireKm = incoming.accumulatedKm > match.accumulatedKm + 0.1f
+                    if (hasNewerService || hasHigherTireKm) {
+                        val updated = match.copy(
+                            intervalKm = incoming.intervalKm ?: match.intervalKm,
+                            intervalMonths = incoming.intervalMonths ?: match.intervalMonths,
+                            lastDoneKm = if (hasNewerService) incoming.lastDoneKm else match.lastDoneKm,
+                            lastDoneTimeMs = maxOf(match.lastDoneTimeMs, incoming.lastDoneTimeMs),
+                            accumulatedKm = maxOf(match.accumulatedKm, incoming.accumulatedKm),
+                            purchasePriceUah = incoming.purchasePriceUah ?: match.purchasePriceUah,
+                            note = incoming.note.ifBlank { match.note }
+                        )
+                        db.update(
+                            TABLE_CONSUMABLES,
+                            toConsumableContentValues(updated),
+                            "$COL_ID = ?",
+                            arrayOf(match.id.toString())
+                        )
+                        restored++
+                    }
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return restored
+    }
+
+    private fun expenseDedupKey(e: ExpenseRecord): String {
+        return "${e.timestampMs / 60_000L}|${e.category.key}|${e.title.trim()}|${(e.amountUah * 100f).toInt()}"
+    }
 }

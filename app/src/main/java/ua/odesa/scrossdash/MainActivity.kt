@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -15,6 +16,11 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import ua.odesa.scrossdash.service.ParkingLocationHelper
 import ua.odesa.scrossdash.service.TripNotificationHelper
 import ua.odesa.scrossdash.ui.PhoneDashboardScreen
 import ua.odesa.scrossdash.ui.SCrossTheme
@@ -30,6 +36,41 @@ class MainActivity : ComponentActivity() {
         val app = application as SCrossApplication
         app.obdManager.refreshPairedDevices()
         app.obdManager.start()
+    }
+
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        val granted = results[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            results[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        if (granted) {
+            saveCurrentParkingPin()
+        } else {
+            Toast.makeText(this, "Надайте дозвіл на геолокацію для збереження парковки", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private val restoreZipLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val app = application as SCrossApplication
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                app.logExporter.restoreBackupFromUri(uri, app.dbHelper)
+            }
+            if (result.errorMessage != null) {
+                Toast.makeText(this@MainActivity, result.errorMessage, Toast.LENGTH_LONG).show()
+            } else {
+                app.tripRepository.reloadTrips()
+                app.expenseRepository.reloadAll()
+                Toast.makeText(
+                    this@MainActivity,
+                    "Відновлено: ${result.tripsRestored} поїздок, ${result.expensesRestored} витрат, ${result.consumablesRestored} поз. ТО",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -136,9 +177,41 @@ class MainActivity : ComponentActivity() {
                     },
                     onMarkConsumableServiced = { item, odoKm, costUah, note, resetTireKm ->
                         app.expenseRepository.markConsumableServiced(item, odoKm, costUah, note, resetTireKm)
+                    },
+                    onWashReminderDaysChanged = { app.settingsRepository.updateWashReminderDays(it) },
+                    onAutoParkingChanged = { app.settingsRepository.setAutoParkingEnabled(it) },
+                    onSaveParkingNow = {
+                        if (ParkingLocationHelper.hasLocationPermission(this)) {
+                            saveCurrentParkingPin()
+                        } else {
+                            locationPermissionLauncher.launch(
+                                arrayOf(
+                                    Manifest.permission.ACCESS_FINE_LOCATION,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION
+                                )
+                            )
+                        }
+                    },
+                    onOpenParkingMaps = { lat, lng ->
+                        ParkingLocationHelper.openWalkingRouteToCar(this, lat, lng)
+                    },
+                    onClearParkingPin = { app.settingsRepository.clearParkingLocation() },
+                    onRestoreFromZip = {
+                        restoreZipLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
                     }
                 )
             }
+        }
+    }
+
+    private fun saveCurrentParkingPin() {
+        val app = application as SCrossApplication
+        val coords = ParkingLocationHelper.captureLastKnownLocation(this)
+        if (coords != null) {
+            app.settingsRepository.saveParkingLocation(coords.first, coords.second)
+            Toast.makeText(this, "Місце парковки збережено", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Не вдалося отримати GPS-координати. Увімкніть геолокацію.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -172,6 +245,8 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             perms.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+        perms.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
         permissionLauncher.launch(perms.toTypedArray())
     }
 }

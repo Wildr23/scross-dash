@@ -12,8 +12,13 @@ import androidx.car.app.model.Action
 import androidx.car.app.model.ActionStrip
 import androidx.car.app.model.Template
 import androidx.car.app.navigation.model.NavigationTemplate
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.combine
 import ua.odesa.scrossdash.SCrossApplication
+import ua.odesa.scrossdash.data.db.AutoCockpitExtras
+import ua.odesa.scrossdash.data.db.computeAutoCockpitExtras
 import ua.odesa.scrossdash.domain.SolarTwilightHelper
 import ua.odesa.scrossdash.model.DashboardState
 
@@ -30,7 +35,14 @@ class SCrossDashboardScreen(carContext: CarContext) : Screen(carContext) {
     private var surfaceHeight: Int = 0
     private var redrawJob: Job? = null
     private var animJob: Job? = null
+    private var flowAnimJob: Job? = null
     private var latestState: DashboardState = app.telemetryEngine.state.value
+    private var latestExtras: AutoCockpitExtras = computeAutoCockpitExtras(
+        expenses = app.expenseRepository.expenses.value,
+        consumables = app.expenseRepository.consumables.value,
+        currentOdometerKm = app.settingsRepository.settings.value.odometerKm,
+        washReminderDays = app.settingsRepository.settings.value.washReminderDays
+    )
     private var lastThemeMode: String = app.settingsRepository.settings.value.themeMode
 
     private val animInterpolator = PathInterpolator(0.4f, 0f, 0.2f, 1f) // FastOutSlowIn
@@ -44,6 +56,7 @@ class SCrossDashboardScreen(carContext: CarContext) : Screen(carContext) {
                 visibleArea = Rect(0, 0, surfaceContainer.width, surfaceContainer.height)
             }
             scheduleRedrawBurst()
+            startFlowAnimationLoop()
         }
 
         override fun onVisibleAreaChanged(visibleArea: Rect) {
@@ -60,6 +73,7 @@ class SCrossDashboardScreen(carContext: CarContext) : Screen(carContext) {
             surface = null
             redrawJob?.cancel()
             animJob?.cancel()
+            flowAnimJob?.cancel()
         }
 
         override fun onClick(x: Float, y: Float) {
@@ -80,9 +94,36 @@ class SCrossDashboardScreen(carContext: CarContext) : Screen(carContext) {
         app.obdManager.start()
         carContext.getCarService(AppManager::class.java).setSurfaceCallback(surfaceCallback)
 
+        lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onDestroy(owner: LifecycleOwner) {
+                redrawJob?.cancel()
+                animJob?.cancel()
+                flowAnimJob?.cancel()
+                scope.cancel()
+            }
+        })
+
         scope.launch {
             app.telemetryEngine.state.collect { newState ->
                 latestState = newState
+                drawFrame()
+            }
+        }
+
+        scope.launch {
+            combine(
+                app.expenseRepository.expenses,
+                app.expenseRepository.consumables,
+                app.settingsRepository.settings
+            ) { expenses, consumables, settings ->
+                computeAutoCockpitExtras(
+                    expenses = expenses,
+                    consumables = consumables,
+                    currentOdometerKm = settings.odometerKm,
+                    washReminderDays = settings.washReminderDays
+                )
+            }.collect { extras ->
+                latestExtras = extras
                 drawFrame()
             }
         }
@@ -100,6 +141,33 @@ class SCrossDashboardScreen(carContext: CarContext) : Screen(carContext) {
 
     fun onCarConfigUpdated() {
         drawFrame()
+    }
+
+    private fun startFlowAnimationLoop() {
+        flowAnimJob?.cancel()
+        flowAnimJob = scope.launch {
+            var lastFrameMs = System.currentTimeMillis()
+            while (isActive) {
+                delay(40L) // ~25 fps smooth 48V energy particle flow & pulsing hub
+                val currentSurface = surface
+                if (currentSurface == null || !currentSurface.isValid) break
+
+                val nowMs = System.currentTimeMillis()
+                val dtSec = (nowMs - lastFrameMs).coerceIn(16L, 200L) / 1000f
+                lastFrameMs = nowMs
+
+                renderer.advanceFlowPhase(dtSec, latestState.hybridMode, latestState.rpm)
+
+                val shouldRedrawGridOrTripOverlay =
+                    renderer.activeOverlay == BentoCanvasRenderer.ActiveOverlay.NONE ||
+                        renderer.activeOverlay == BentoCanvasRenderer.ActiveOverlay.TRIP_DETAILS ||
+                        renderer.animProgress < 0.99f
+
+                if (animJob?.isActive != true && shouldRedrawGridOrTripOverlay) {
+                    drawFrame()
+                }
+            }
+        }
     }
 
     private fun triggerOverlayAnimation(open: Boolean) {
@@ -189,7 +257,7 @@ class SCrossDashboardScreen(carContext: CarContext) : Screen(carContext) {
 
             val canvas = targetSurface.lockCanvas(null)
             try {
-                renderer.draw(canvas, effectiveArea, latestState, isDarkMode)
+                renderer.draw(canvas, effectiveArea, latestState, isDarkMode, latestExtras)
             } finally {
                 targetSurface.unlockCanvasAndPost(canvas)
             }

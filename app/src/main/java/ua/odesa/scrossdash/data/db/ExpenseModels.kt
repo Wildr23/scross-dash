@@ -450,3 +450,69 @@ fun buildConsumablesCsv(items: List<ConsumableItem>, currentOdometerKm: Float): 
     }
     return sb.toString()
 }
+
+data class AutoCockpitExtras(
+    val daysSinceWash: Int? = null,
+    val isWashDue: Boolean = false,
+    val nearestServiceKm: Int? = null,
+    val isServiceUrgent: Boolean = false
+)
+
+fun computeAutoCockpitExtras(
+    expenses: List<ExpenseRecord>,
+    consumables: List<ConsumableItem>,
+    currentOdometerKm: Float,
+    nowMs: Long = System.currentTimeMillis(),
+    washReminderDays: Int = 14
+): AutoCockpitExtras {
+    val latestWashMs = expenses
+        .asSequence()
+        .filter { it.category == ExpenseCategory.WASH }
+        .maxOfOrNull { it.timestampMs }
+
+    val daysSinceWash = latestWashMs?.let {
+        ((nowMs - it).coerceAtLeast(0L) / 86_400_000L).toInt()
+    }
+    val isWashDue = daysSinceWash != null && daysSinceWash >= washReminderDays.coerceAtLeast(1)
+
+    val nearestService = consumables
+        .asSequence()
+        .filter { !it.isTireSet && it.lastDoneTimeMs > 0L && it.intervalKm != null }
+        .map { item -> computeConsumableStatus(item, currentOdometerKm, nowMs) }
+        .filter { it.remainingKm != null }
+        .minByOrNull { it.remainingKm!! }
+
+    val nearestServiceKm = nearestService?.remainingKm?.roundToInt()
+    val isServiceUrgent = nearestService?.urgency == ConsumableUrgency.OVERDUE ||
+        nearestService?.urgency == ConsumableUrgency.SOON
+
+    return AutoCockpitExtras(
+        daysSinceWash = daysSinceWash,
+        isWashDue = isWashDue,
+        nearestServiceKm = nearestServiceKm,
+        isServiceUrgent = isServiceUrgent
+    )
+}
+
+fun buildTripsCsv(trips: List<TripRecord>): String {
+    val sb = StringBuilder()
+    sb.appendLine("start_time_ms,end_time_ms,distance_km,fuel_used_liters,fuel_cost_uah,avg_consumption,hybrid_saved_liters,hybrid_saved_uah,eco_score,care_score,remaining_tank_liters,csv_file_name")
+    for (t in trips) {
+        val row = listOf(
+            t.startTimeMs.toString(),
+            t.endTimeMs.toString(),
+            String.format(Locale.US, "%.2f", t.distanceKm),
+            String.format(Locale.US, "%.3f", t.fuelUsedLiters),
+            String.format(Locale.US, "%.2f", t.fuelCostUah),
+            String.format(Locale.US, "%.2f", t.avgConsumption100Km),
+            String.format(Locale.US, "%.4f", t.hybridSavedLiters),
+            String.format(Locale.US, "%.2f", t.hybridSavedUah),
+            t.ecoScore.toString(),
+            t.careScore.toString(),
+            String.format(Locale.US, "%.2f", t.remainingTankLiters),
+            csvEscape(t.csvFileName ?: "")
+        )
+        sb.appendLine(row.joinToString(","))
+    }
+    return sb.toString()
+}

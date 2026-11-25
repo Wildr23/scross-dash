@@ -19,6 +19,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AccountBalanceWallet
 import androidx.compose.material.icons.rounded.BarChart
 import androidx.compose.material.icons.rounded.DirectionsCar
+import androidx.compose.material.icons.rounded.DirectionsWalk
+import androidx.compose.material.icons.rounded.LocalCarWash
+import androidx.compose.material.icons.rounded.LocationOn
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -36,11 +41,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import ua.odesa.scrossdash.data.db.AutoRefuelEvent
 import ua.odesa.scrossdash.data.db.ConsumableItem
+import ua.odesa.scrossdash.data.db.ExpenseCategory
 import ua.odesa.scrossdash.data.db.ExpenseRecord
 import ua.odesa.scrossdash.data.db.TripRecord
 import ua.odesa.scrossdash.data.log.CsvLogStats
+import ua.odesa.scrossdash.domain.DtcDecoder
+import ua.odesa.scrossdash.domain.DtcSeverity
 import ua.odesa.scrossdash.model.AppSettings
 import ua.odesa.scrossdash.model.DashboardState
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -87,7 +97,13 @@ fun PhoneDashboardScreen(
     onUpdateConsumable: (ConsumableItem) -> Unit = {},
     onDeleteConsumable: (Long) -> Unit = {},
     onSwitchTireSet: (Long, Float?, Float, String) -> Unit = { _, _, _, _ -> },
-    onMarkConsumableServiced: (ConsumableItem, Float, Float?, String, Boolean) -> Unit = { _, _, _, _, _ -> }
+    onMarkConsumableServiced: (ConsumableItem, Float, Float?, String, Boolean) -> Unit = { _, _, _, _, _ -> },
+    onWashReminderDaysChanged: (Int) -> Unit = {},
+    onAutoParkingChanged: (Boolean) -> Unit = {},
+    onSaveParkingNow: () -> Unit = {},
+    onOpenParkingMaps: (Double, Double) -> Unit = { _, _ -> },
+    onClearParkingPin: () -> Unit = {},
+    onRestoreFromZip: () -> Unit = {}
 ) {
     val ext = LocalSCrossColors.current
     var selectedTab by remember(initialTab, tabTriggerKey) {
@@ -193,6 +209,7 @@ fun PhoneDashboardScreen(
                     state = state,
                     settings = settings,
                     pairedDevices = pairedDevices,
+                    expenses = expenses,
                     csvStats = csvStats,
                     onSelectDevice = onSelectDevice,
                     onToggleDemo = onToggleDemo,
@@ -204,10 +221,18 @@ fun PhoneDashboardScreen(
                     onScanDtc = onScanDtc,
                     onClearDtc = onClearDtc,
                     onExportCsv = onExportCsv,
+                    onExportAllZip = onExportAllZip,
+                    onRestoreFromZip = onRestoreFromZip,
                     onClearCsvLogs = onClearCsvLogs,
                     onDismissHeadlightsAlert = onDismissHeadlightsAlert,
                     onThemeModeChanged = onThemeModeChanged,
-                    onHeadlightsReminderChanged = onHeadlightsReminderChanged
+                    onHeadlightsReminderChanged = onHeadlightsReminderChanged,
+                    onWashReminderDaysChanged = onWashReminderDaysChanged,
+                    onAutoParkingChanged = onAutoParkingChanged,
+                    onSaveParkingNow = onSaveParkingNow,
+                    onOpenParkingMaps = onOpenParkingMaps,
+                    onClearParkingPin = onClearParkingPin,
+                    onAddExpense = onAddExpense
                 )
                 1 -> TripAnalyticsTab(
                     trips = trips,
@@ -224,6 +249,7 @@ fun PhoneDashboardScreen(
                     trips = trips,
                     currentOdometerKm = settings.odometerKm,
                     defaultFuelPriceUah = settings.fuelPriceUah,
+                    washReminderDays = settings.washReminderDays,
                     pendingRefuel = pendingRefuel,
                     onConfirmPendingRefuel = onConfirmPendingRefuel,
                     onConfirmPendingRefuelEdited = onConfirmPendingRefuelEdited,
@@ -250,6 +276,7 @@ private fun LiveDashboardTab(
     state: DashboardState,
     settings: AppSettings,
     pairedDevices: List<BluetoothDevice>,
+    expenses: List<ExpenseRecord>,
     csvStats: CsvLogStats,
     onSelectDevice: (String, String) -> Unit,
     onToggleDemo: (Boolean) -> Unit,
@@ -261,17 +288,65 @@ private fun LiveDashboardTab(
     onScanDtc: () -> Unit,
     onClearDtc: () -> Unit,
     onExportCsv: () -> Unit,
+    onExportAllZip: () -> Unit,
+    onRestoreFromZip: () -> Unit,
     onClearCsvLogs: () -> Unit,
     onDismissHeadlightsAlert: () -> Unit,
     onThemeModeChanged: (String) -> Unit,
-    onHeadlightsReminderChanged: (Boolean) -> Unit
+    onHeadlightsReminderChanged: (Boolean) -> Unit,
+    onWashReminderDaysChanged: (Int) -> Unit,
+    onAutoParkingChanged: (Boolean) -> Unit,
+    onSaveParkingNow: () -> Unit,
+    onOpenParkingMaps: (Double, Double) -> Unit,
+    onClearParkingPin: () -> Unit,
+    onAddExpense: (ExpenseRecord, Long?) -> Unit
 ) {
     val ext = LocalSCrossColors.current
     val cardBorder = BorderStroke(1.dp, ext.cardBorder)
-    var priceText by remember(settings.fuelPriceUah) { mutableStateOf(settings.fuelPriceUah.toString()) }
-    var calibText by remember(settings.mafCalibration) { mutableStateOf(settings.mafCalibration.toString()) }
-    var showAllBtDevices by remember { mutableStateOf(false) }
     var expandedCard by remember { mutableStateOf<String?>(null) }
+    var showSettingsDialog by remember { mutableStateOf(false) }
+    var showQuickWashDialog by remember { mutableStateOf(false) }
+    var showDtcLookupDialog by remember { mutableStateOf(false) }
+    val parkingDateFmt = remember { SimpleDateFormat("dd.MM о HH:mm", Locale.getDefault()) }
+
+    if (showSettingsDialog) {
+        SettingsDialog(
+            settings = settings,
+            pairedDevices = pairedDevices,
+            csvStats = csvStats,
+            onDismiss = { showSettingsDialog = false },
+            onSelectDevice = onSelectDevice,
+            onToggleDemo = onToggleDemo,
+            onThemeModeChanged = onThemeModeChanged,
+            onWashReminderDaysChanged = onWashReminderDaysChanged,
+            onAutoParkingChanged = onAutoParkingChanged,
+            onHeadlightsReminderChanged = onHeadlightsReminderChanged,
+            onFuelPriceChanged = onFuelPriceChanged,
+            onCalibrationChanged = onCalibrationChanged,
+            onExportAllZip = onExportAllZip,
+            onRestoreFromZip = onRestoreFromZip,
+            onExportCsv = onExportCsv,
+            onClearCsvLogs = onClearCsvLogs
+        )
+    }
+
+    if (showQuickWashDialog) {
+        QuickWashDialog(
+            currentOdometerKm = settings.odometerKm,
+            onDismiss = { showQuickWashDialog = false },
+            onSave = { record ->
+                onAddExpense(record, null)
+                showQuickWashDialog = false
+            }
+        )
+    }
+
+    if (showDtcLookupDialog) {
+        DtcLookupDialog(
+            activeCodes = state.dtcCodes,
+            onDismiss = { showDtcLookupDialog = false }
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -280,19 +355,51 @@ private fun LiveDashboardTab(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Header
-        Column(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
-            Text(
-                text = "S-Cross Dash",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.ExtraBold,
-                color = ext.textPrimary
-            )
-            Text(
-                text = "Suzuki 1.4 BoosterJet • 48V Mild Hybrid",
-                style = MaterialTheme.typography.bodySmall,
-                color = ext.textMuted
-            )
+        // Header with ⚙️ Settings Trigger
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "S-Cross Dash",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = ext.textPrimary
+                )
+                Text(
+                    text = "Suzuki 1.4 BoosterJet • 48V Mild Hybrid",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = ext.textMuted
+                )
+            }
+            Box {
+                FilledTonalIconButton(
+                    onClick = { showSettingsDialog = true },
+                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                        containerColor = ext.card,
+                        contentColor = ext.textPrimary
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Settings,
+                        contentDescription = "Налаштування"
+                    )
+                }
+                if (settings.selectedDeviceMac.isBlank() && !settings.demoMode) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(6.dp)
+                            .size(9.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(ext.accentAmber)
+                    )
+                }
+            }
         }
 
         // Headlights Safety Alert Banner
@@ -734,139 +841,114 @@ private fun LiveDashboardTab(
             }
         }
 
-        // 4. Bluetooth Adapter Selection
+        // 4. Car Wash Reminder Card
+        val latestWash = remember(expenses) {
+            expenses.filter { it.category == ExpenseCategory.WASH }.maxByOrNull { it.timestampMs }
+        }
+        val daysSinceWash = remember(latestWash) {
+            latestWash?.let { ((System.currentTimeMillis() - it.timestampMs).coerceAtLeast(0L) / 86_400_000L).toInt() }
+        }
+        val isWashDue = daysSinceWash != null && daysSinceWash >= settings.washReminderDays.coerceAtLeast(1)
+
         Card(
             colors = CardDefaults.cardColors(containerColor = ext.card),
-            border = cardBorder,
+            border = if (isWashDue) BorderStroke(1.5.dp, ext.accentAmber) else cardBorder,
             shape = RoundedCornerShape(18.dp)
         ) {
             Column(
                 modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.LocalCarWash,
+                            contentDescription = "Мийка",
+                            tint = if (isWashDue) ext.accentAmber else ext.accentCyan
+                        )
                         Text(
-                            text = "Демо-режим",
+                            text = "Догляд та мийка авто",
                             color = ext.textPrimary,
-                            fontWeight = FontWeight.SemiBold,
+                            fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.titleSmall
                         )
+                    }
+                    if (isWashDue) {
+                        Surface(
+                            color = ext.statusStandbyBg,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = "Час на мийку!",
+                                color = ext.statusStandbyFg,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                    } else if (daysSinceWash != null) {
                         Text(
-                            text = "Тестування без реального авто",
+                            text = "Інтервал: ${settings.washReminderDays} дн",
                             color = ext.textMuted,
-                            style = MaterialTheme.typography.bodySmall
+                            style = MaterialTheme.typography.labelSmall
                         )
                     }
-                    Switch(
-                        checked = settings.demoMode,
-                        onCheckedChange = onToggleDemo
+                }
+
+                val washSummaryText = when (daysSinceWash) {
+                    null -> "Мийок ще не додано — зафіксуйте першу в 1 тап"
+                    0 -> "Авто помите сьогодні (${latestWash?.title ?: "Мийка"})"
+                    1 -> "Остання мийка: 1 день тому"
+                    else -> "Остання мийка: $daysSinceWash дн тому"
+                }
+                Text(
+                    text = washSummaryText,
+                    color = if (isWashDue) ext.accentAmber else ext.textSecondary,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = if (isWashDue) FontWeight.SemiBold else FontWeight.Normal
+                )
+
+                if (daysSinceWash != null) {
+                    val freshness = (1f - (daysSinceWash.toFloat() / settings.washReminderDays.coerceAtLeast(1))).coerceIn(0.04f, 1f)
+                    LinearProgressIndicator(
+                        progress = { freshness },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(3.dp)),
+                        color = if (isWashDue) ext.accentAmber else ext.accentCyan,
+                        trackColor = ext.progressTrack
                     )
                 }
 
-                HorizontalDivider(color = ext.divider, thickness = 1.dp)
-
-                Text(
-                    text = "Оберіть адаптер ELM327 (PIC18F25K80):",
-                    color = ext.textMuted,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Medium
-                )
-
-                if (pairedDevices.isEmpty()) {
-                    Surface(
-                        color = ext.warningBoxBg,
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = "Спарених пристроїв не знайдено. Підключіть адаптер OBDII у Bluetooth налаштуваннях телефону (PIN 1234).",
-                            color = ext.warningBoxFg,
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.padding(12.dp)
-                        )
-                    }
-                } else {
-                    val obdKeywords = listOf("OBD", "ELM", "VGATE", "VIECOW", "KONNWEI", "SCAN", "CAR")
-                    val (obdDevices, otherDevices) = pairedDevices.partition { dev ->
-                        val name = dev.name?.uppercase() ?: ""
-                        obdKeywords.any { name.contains(it) } || dev.address == settings.selectedDeviceMac
-                    }
-
-                    val displayedDevices = if (showAllBtDevices || otherDevices.isEmpty()) {
-                        obdDevices + otherDevices
-                    } else {
-                        obdDevices
-                    }
-
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        displayedDevices.forEach { dev ->
-                            val isSelected = dev.address == settings.selectedDeviceMac
-                            val devName = dev.name ?: "Unknown"
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable { onSelectDevice(dev.address, devName) }
-                                    .border(
-                                        width = if (isSelected) 1.5.dp else 1.dp,
-                                        color = if (isSelected) ext.selectedGreenBorder else ext.cardBorder,
-                                        shape = RoundedCornerShape(12.dp)
-                                    ),
-                                color = if (isSelected) ext.selectedGreenBg else ext.innerTile
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = devName,
-                                            color = if (isSelected) ext.selectedGreenFg else ext.textPrimary,
-                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                            style = MaterialTheme.typography.bodyMedium
-                                        )
-                                        Text(
-                                            text = dev.address,
-                                            color = ext.textMuted,
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
-                                    }
-                                    if (isSelected) {
-                                        Text(
-                                            text = "✓ Обрано",
-                                            color = ext.accentGreen,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        if (otherDevices.isNotEmpty()) {
-                            TextButton(
-                                onClick = { showAllBtDevices = !showAllBtDevices },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(
-                                    text = if (showAllBtDevices) "Приховати інші Bluetooth пристрої" else "Показати всі пристрої (${pairedDevices.size})",
-                                    color = ext.accentBlue,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                        }
-                    }
+                Button(
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = { showQuickWashDialog = true },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isWashDue) ext.accentAmber else ext.accentBlue,
+                        contentColor = Color.White
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.LocalCarWash,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Помив авто", fontWeight = FontWeight.Bold)
                 }
             }
         }
 
-        // 5. Theme & Calculation Settings Card
+        // 5. Auto Parking Location Card
         Card(
             colors = CardDefaults.cardColors(containerColor = ext.card),
             border = cardBorder,
@@ -876,145 +958,98 @@ private fun LiveDashboardTab(
                 modifier = Modifier.padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text(
-                    text = "Тема оформлення (телефон та Android Auto)",
-                    color = ext.textMuted,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleSmall
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    val themes = listOf(
-                        Pair("AUTO", "⚙️ Авто"),
-                        Pair("LIGHT", "☀️ День"),
-                        Pair("DARK", "🌙 Ніч")
-                    )
-                    themes.forEach { (mode, label) ->
-                        val isSelected = settings.themeMode == mode
-                        Surface(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(10.dp))
-                                .clickable { onThemeModeChanged(mode) }
-                                .border(
-                                    width = if (isSelected) 1.5.dp else 1.dp,
-                                    color = if (isSelected) ext.selectedGreenBorder else ext.cardBorder,
-                                    shape = RoundedCornerShape(10.dp)
-                                ),
-                            color = if (isSelected) ext.selectedGreenBg else ext.innerTile
-                        ) {
-                            Box(
-                                modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = label,
-                                    color = if (isSelected) ext.selectedGreenFg else ext.textPrimary,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-                    }
-                }
-
-                HorizontalDivider(color = ext.divider, thickness = 1.dp)
-
-                // Opt-in Auto-Headlights Reminder toggle (default disabled)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 12.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        Icon(
+                            imageVector = Icons.Rounded.LocationOn,
+                            contentDescription = "Парковка",
+                            tint = ext.accentGreen
+                        )
                         Text(
-                            text = "Нагадування про фари (AUTO)",
+                            text = "Місце парковки авто",
                             color = ext.textPrimary,
-                            fontWeight = FontWeight.SemiBold,
+                            fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.titleSmall
                         )
-                        Text(
-                            text = "Попереджати після заходу сонця, якщо Android Auto у денному режимі",
-                            color = ext.textMuted,
-                            style = MaterialTheme.typography.bodySmall
-                        )
                     }
-                    Switch(
-                        checked = settings.headlightsReminderEnabled,
-                        onCheckedChange = onHeadlightsReminderChanged
-                    )
+                    if (settings.parkingLat != null && settings.parkingLng != null) {
+                        TextButton(
+                            onClick = onClearParkingPin,
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
+                        ) {
+                            Text("Скинути", color = ext.textMuted, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
                 }
 
-                HorizontalDivider(color = ext.divider, thickness = 1.dp)
-
-                Text(
-                    text = "Налаштування розрахунків",
-                    color = ext.textMuted,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleSmall
-                )
-                OutlinedTextField(
-                    value = priceText,
-                    onValueChange = {
-                        priceText = it
-                        it.toFloatOrNull()?.let(onFuelPriceChanged)
-                    },
-                    label = { Text("Ціна пального (грн / літр)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp)
-                )
-                OutlinedTextField(
-                    value = calibText,
-                    onValueChange = {
-                        calibText = it
-                        it.toFloatOrNull()?.let(onCalibrationChanged)
-                    },
-                    label = { Text("Коефіцієнт калібрування MAF (за замовч. 1.00)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp)
-                )
-
-                HorizontalDivider(color = ext.divider, thickness = 1.dp)
-
-                Surface(
-                    color = ext.infoBannerBg,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
+                val pLat = settings.parkingLat
+                val pLng = settings.parkingLng
+                if (pLat != null && pLng != null) {
+                    val whenSaved = if (settings.parkingTimestampMs > 0L) {
+                        "Збережено ${parkingDateFmt.format(Date(settings.parkingTimestampMs))}"
+                    } else {
+                        "Збережені координати"
+                    }
+                    Text(
+                        text = "$whenSaved  •  ${String.format(Locale.US, "%.5f, %.5f", pLat, pLng)}",
+                        color = ext.textSecondary,
+                        style = MaterialTheme.typography.bodySmall
+                    )
                     Row(
-                        modifier = Modifier.padding(12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text(text = "⚡", style = MaterialTheme.typography.titleMedium)
-                        Column {
-                            Text(
-                                text = "Автозапуск у фоні (Samsung One UI)",
-                                color = ext.accentBlue,
-                                fontWeight = FontWeight.Bold,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Text(
-                                text = "Для надійного автозапуску запису поїздок при підключенні до авто: у налаштуваннях додатка встановіть «Батарея» → «Необмежено» (Unrestricted).",
-                                color = ext.textMuted,
-                                style = MaterialTheme.typography.bodySmall
-                            )
+                        Button(
+                            modifier = Modifier.weight(1.3f),
+                            onClick = { onOpenParkingMaps(pLat, pLng) },
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = ext.accentGreen, contentColor = Color.White)
+                        ) {
+                            Icon(Icons.Rounded.DirectionsWalk, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Маршрут до авто", maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
+                        OutlinedButton(
+                            modifier = Modifier.weight(0.8f),
+                            onClick = onSaveParkingNow,
+                            shape = RoundedCornerShape(12.dp),
+                            border = cardBorder
+                        ) {
+                            Text("Оновити", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                } else {
+                    Text(
+                        text = if (settings.autoParkingEnabled) {
+                            "Координати парковки збережуться автоматично при глушінні двигуна."
+                        } else {
+                            "Авто-збереження парковки вимкнене в налаштуваннях (⚙️)."
+                        },
+                        color = ext.textMuted,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = onSaveParkingNow,
+                        shape = RoundedCornerShape(12.dp),
+                        border = cardBorder
+                    ) {
+                        Icon(Icons.Rounded.LocationOn, contentDescription = null, modifier = Modifier.size(17.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Зберегти місце зараз")
                     }
                 }
             }
         }
 
-        // 6. DTC Diagnostics Card
+        // 6. DTC Diagnostics Card with Ukrainian Decoder
         Card(
             colors = CardDefaults.cardColors(containerColor = ext.card),
             border = cardBorder,
@@ -1024,18 +1059,88 @@ private fun LiveDashboardTab(
                 modifier = Modifier.padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text(
-                    text = "Діагностика помилок ECU (DTC)",
-                    color = ext.textMuted,
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleSmall
-                )
-                Text(
-                    text = if (state.dtcCodes.isEmpty()) "Активних помилок не виявлено" else "Знайдені коди: ${state.dtcCodes.joinToString(", ")}",
-                    color = if (state.dtcCodes.isEmpty()) ext.accentGreen else ext.accentRed,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Діагностика помилок ECU (DTC)",
+                        color = ext.textMuted,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    TextButton(
+                        onClick = { showDtcLookupDialog = true },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                    ) {
+                        Icon(Icons.Rounded.Search, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Довідник", color = ext.accentBlue, style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+
+                if (state.dtcCodes.isEmpty()) {
+                    Text(
+                        text = "Активних помилок не виявлено",
+                        color = ext.accentGreen,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium
+                    )
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        state.dtcCodes.forEach { rawCode ->
+                            val decoded = remember(rawCode) { DtcDecoder.decode(rawCode) }
+                            val sevColor = when (decoded.severity) {
+                                DtcSeverity.CRITICAL -> ext.accentRed
+                                DtcSeverity.WARNING -> ext.accentAmber
+                                DtcSeverity.INFO -> ext.accentBlue
+                            }
+                            Surface(
+                                color = ext.innerTile,
+                                border = BorderStroke(1.dp, sevColor.copy(alpha = 0.45f)),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "${decoded.code} • ${decoded.subsystemUk}",
+                                            color = sevColor,
+                                            fontWeight = FontWeight.Bold,
+                                            style = MaterialTheme.typography.labelLarge
+                                        )
+                                        Text(
+                                            text = decoded.severity.labelUk,
+                                            color = sevColor,
+                                            fontWeight = FontWeight.Bold,
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                    Text(
+                                        text = decoded.titleUk,
+                                        color = ext.textPrimary,
+                                        fontWeight = FontWeight.SemiBold,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    Text(
+                                        text = decoded.detailsUk,
+                                        color = ext.textMuted,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -1055,87 +1160,6 @@ private fun LiveDashboardTab(
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = ext.accentRed)
                     ) {
                         Text("Скинути помилки")
-                    }
-                }
-            }
-        }
-
-        // 7. Active CSV Logger Indicator Card
-        Card(
-            colors = CardDefaults.cardColors(containerColor = ext.card),
-            border = cardBorder,
-            shape = RoundedCornerShape(18.dp)
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Активний CSV логер телеметрії",
-                        color = ext.accentBlue,
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleSmall
-                    )
-                    Surface(
-                        color = ext.pillNeutralBg,
-                        shape = RoundedCornerShape(6.dp)
-                    ) {
-                        Text(
-                            text = "CSV • макс 50",
-                            color = ext.textMuted,
-                            style = MaterialTheme.typography.labelSmall,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(
-                        text = "Файл: ${csvStats.currentFileName}",
-                        color = ext.textSecondary,
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    val sizeKb = (csvStats.fileSizeBytes / 1024f)
-                    val sizeStr = if (sizeKb >= 1024f) String.format(Locale.US, "%.1f МБ", sizeKb / 1024f) else String.format(Locale.US, "%.0f КБ", sizeKb)
-                    Text(
-                        text = "Рядків: ${csvStats.rowCount} • Розмір: $sizeStr • Збережено файлів: ${csvStats.totalLogFilesCount}",
-                        color = ext.textMuted,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Button(
-                        modifier = Modifier.weight(1.3f),
-                        onClick = onExportCsv,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF0284C7),
-                            contentColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Text("Поточний CSV", color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                    OutlinedButton(
-                        modifier = Modifier.weight(0.9f),
-                        onClick = onClearCsvLogs,
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, ext.cardBorder),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = ext.textMuted)
-                    ) {
-                        Text("Очистити", maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
             }

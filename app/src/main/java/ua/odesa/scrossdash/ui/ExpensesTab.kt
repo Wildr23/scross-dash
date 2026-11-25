@@ -100,6 +100,7 @@ fun ExpensesTab(
     trips: List<TripRecord>,
     currentOdometerKm: Float,
     defaultFuelPriceUah: Float,
+    washReminderDays: Int = 14,
     pendingRefuel: AutoRefuelEvent? = null,
     onConfirmPendingRefuel: () -> Unit = {},
     onConfirmPendingRefuelEdited: (ExpenseRecord) -> Unit = {},
@@ -336,6 +337,73 @@ fun ExpensesTab(
                     },
                     onDismiss = onDismissPendingRefuel
                 )
+            }
+
+            // Compact Wash Reminder Status Bar
+            val latestWashMs = remember(expenses) {
+                expenses.filter { it.category == ExpenseCategory.WASH }.maxOfOrNull { it.timestampMs }
+            }
+            val washDaysAgo = remember(latestWashMs) {
+                latestWashMs?.let { ((System.currentTimeMillis() - it).coerceAtLeast(0L) / 86_400_000L).toInt() }
+            }
+            val washDue = washDaysAgo != null && washDaysAgo >= washReminderDays.coerceAtLeast(1)
+            Surface(
+                color = if (washDue) ext.warningBoxBg else ext.card,
+                border = BorderStroke(1.dp, if (washDue) ext.accentAmber else ext.cardBorder),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.LocalCarWash,
+                            contentDescription = "Мийка",
+                            tint = if (washDue) ext.accentAmber else ext.accentGreen,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = when (washDaysAgo) {
+                                null -> "🫧 Мийка: ще не фіксувалась"
+                                0 -> "🫧 Мийка: сьогодні"
+                                else -> if (washDue) {
+                                    "🫧 Остання мийка $washDaysAgo дн тому — час помити!"
+                                } else {
+                                    "🫧 Остання мийка $washDaysAgo дн тому (інтервал $washReminderDays дн)"
+                                }
+                            },
+                            color = if (washDue) ext.warningBoxFg else ext.textSecondary,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = if (washDue) FontWeight.Bold else FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    TextButton(
+                        onClick = {
+                            editingExpenseDraft = ExpenseDraft(
+                                category = ExpenseCategory.WASH,
+                                title = "Мийка авто",
+                                odometerKm = currentOdometerKm
+                            )
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = "Помив",
+                            color = ext.accentBlue,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+                }
             }
 
             if (selectedSubTab == 0) {

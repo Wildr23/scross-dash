@@ -7,14 +7,18 @@ import ua.odesa.scrossdash.data.db.TripDatabaseHelper
 import ua.odesa.scrossdash.data.db.TripRepository
 import ua.odesa.scrossdash.data.db.buildConsumablesCsv
 import ua.odesa.scrossdash.data.db.buildExpensesCsv
+import ua.odesa.scrossdash.data.db.buildTripsCsv
 import ua.odesa.scrossdash.data.log.LogExporter
 import ua.odesa.scrossdash.data.log.TelemetryCsvLogger
 import ua.odesa.scrossdash.domain.TelemetryEngine
 import ua.odesa.scrossdash.obd.Elm327BluetoothManager
+import ua.odesa.scrossdash.service.ParkingLocationHelper
 import ua.odesa.scrossdash.service.TripNotificationHelper
 
 class SCrossApplication : Application() {
     lateinit var settingsRepository: SettingsRepository
+        private set
+    lateinit var dbHelper: TripDatabaseHelper
         private set
     lateinit var tripRepository: TripRepository
         private set
@@ -34,7 +38,7 @@ class SCrossApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         settingsRepository = SettingsRepository(this)
-        val dbHelper = TripDatabaseHelper(this)
+        dbHelper = TripDatabaseHelper(this)
         tripRepository = TripRepository(dbHelper)
         expenseRepository = ExpenseRepository(
             dbHelper = dbHelper,
@@ -46,6 +50,10 @@ class SCrossApplication : Application() {
             logger = csvLogger,
             extraZipEntriesProvider = {
                 buildMap {
+                    val currentTrips = tripRepository.trips.value
+                    if (currentTrips.isNotEmpty()) {
+                        put("trips.csv", buildTripsCsv(currentTrips))
+                    }
                     val currentExpenses = expenseRepository.expenses.value
                     if (currentExpenses.isNotEmpty()) {
                         put("expenses.csv", buildExpensesCsv(currentExpenses))
@@ -68,7 +76,14 @@ class SCrossApplication : Application() {
             settingsRepo = settingsRepository,
             tripRepo = tripRepository,
             csvLogger = csvLogger,
-            onTripFinalized = { trip -> tripNotificationHelper.postArrivalSummary(trip) },
+            onTripFinalized = { trip ->
+                if (settingsRepository.settings.value.autoParkingEnabled) {
+                    ParkingLocationHelper.captureLastKnownLocation(this)?.let { (lat, lng) ->
+                        settingsRepository.saveParkingLocation(lat, lng, trip.endTimeMs)
+                    }
+                }
+                tripNotificationHelper.postArrivalSummary(trip)
+            },
             expenseStore = expenseRepository,
             onAutoRefuelDetected = { event -> tripNotificationHelper.postAutoRefuelNotice(event) }
         )

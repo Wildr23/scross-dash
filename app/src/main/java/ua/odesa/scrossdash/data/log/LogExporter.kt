@@ -3,11 +3,13 @@ package ua.odesa.scrossdash.data.log
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import ua.odesa.scrossdash.data.db.TripDatabaseHelper
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -48,6 +50,27 @@ class LogExporter(
         logger.flush()
         val extras = extraZipEntriesProvider?.invoke().orEmpty()
         exportAllLogsAsZip(context, extras)
+    }
+
+    fun restoreBackupFromUri(uri: Uri, dbHelper: TripDatabaseHelper): RestoreResult {
+        return try {
+            val stream = context.contentResolver.openInputStream(uri)
+                ?: return RestoreResult(errorMessage = "Не вдалося відкрити вибраний файл")
+            val parsed = stream.use { BackupRestoreParser.readBackupZip(it) }
+            if (parsed.trips.isEmpty() && parsed.expenses.isEmpty() && parsed.consumables.isEmpty()) {
+                return RestoreResult(errorMessage = "У ZIP-архіві не знайдено файлів trips.csv, expenses.csv чи service_book.csv")
+            }
+            val tripsRestored = dbHelper.restoreTrips(parsed.trips)
+            val expensesRestored = dbHelper.restoreExpenses(parsed.expenses)
+            val consumablesRestored = dbHelper.restoreConsumables(parsed.consumables)
+            RestoreResult(
+                tripsRestored = tripsRestored,
+                expensesRestored = expensesRestored,
+                consumablesRestored = consumablesRestored
+            )
+        } catch (e: Exception) {
+            RestoreResult(errorMessage = e.message ?: "Помилка читання ZIP-архіву")
+        }
     }
 
     private fun exportAndShareSingleFile(logFile: File) {

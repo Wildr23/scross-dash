@@ -1,18 +1,25 @@
 package ua.odesa.scrossdash
 
+import android.content.Intent
+import androidx.car.app.CarContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.junit.Assert.*
 import org.junit.Test
 import ua.odesa.scrossdash.auto.BentoCanvasRenderer
+import ua.odesa.scrossdash.auto.SCrossSession
 import ua.odesa.scrossdash.data.SettingsStore
 import ua.odesa.scrossdash.data.db.*
+import ua.odesa.scrossdash.data.log.BackupRestoreParser
 import ua.odesa.scrossdash.data.log.CsvLogSink
+import ua.odesa.scrossdash.domain.DtcDecoder
+import ua.odesa.scrossdash.domain.DtcSeverity
 import ua.odesa.scrossdash.domain.SolarCalculator
 import ua.odesa.scrossdash.domain.SolarTwilightHelper
 import ua.odesa.scrossdash.domain.TelemetryEngine
 import ua.odesa.scrossdash.model.AppSettings
+import ua.odesa.scrossdash.model.HybridMode
 import ua.odesa.scrossdash.model.RawObdSnapshot
 import ua.odesa.scrossdash.ui.AnalyticsPeriod
 import ua.odesa.scrossdash.ui.computePeriodKpi
@@ -1338,5 +1345,193 @@ class VerificationTest {
             "Aggressive throttle (>= 42%) should deduct from ecoCruiseScore",
             engine.state.value.eco.speedSteadiness < cruiseBeforeBrake
         )
+    }
+
+    @Test
+    fun testNavigationIntentRedirectDetection() {
+        assertTrue(SCrossSession.isNavigationRedirectIntent(CarContext.ACTION_NAVIGATE, "geo"))
+        assertTrue(SCrossSession.isNavigationRedirectIntent(Intent.ACTION_VIEW, "geo"))
+        assertTrue(SCrossSession.isNavigationRedirectIntent(Intent.ACTION_VIEW, "google.navigation"))
+        assertFalse(SCrossSession.isNavigationRedirectIntent(Intent.ACTION_MAIN, null))
+        assertFalse(SCrossSession.isNavigationRedirectIntent(Intent.ACTION_VIEW, "https"))
+    }
+
+    @Test
+    fun testAutoCockpitExtrasWashAndServiceComputation() {
+        val emptyExtras = computeAutoCockpitExtras(emptyList(), emptyList(), currentOdometerKm = 25_000f)
+        assertNull(emptyExtras.daysSinceWash)
+        assertNull(emptyExtras.nearestServiceKm)
+        assertFalse(emptyExtras.isServiceUrgent)
+
+        val nowMs = 1_700_000_000_000L
+        val fiveDaysAgoMs = nowMs - 5L * 86_400_000L
+        val expenses = listOf(
+            ExpenseRecord(
+                id = 1L,
+                timestampMs = fiveDaysAgoMs,
+                category = ExpenseCategory.WASH,
+                title = "Мийка",
+                amountUah = 350f,
+                odometerKm = 24_100f
+            )
+        )
+        val consumables = listOf(
+            ConsumableItem(
+                id = 1L,
+                name = "Олива двигуна + фільтр",
+                category = ExpenseCategory.MAINTENANCE,
+                intervalKm = 10_000,
+                intervalMonths = 12,
+                lastDoneKm = 15_000f,
+                lastDoneTimeMs = fiveDaysAgoMs
+            )
+        )
+        val extras = computeAutoCockpitExtras(
+            expenses = expenses,
+            consumables = consumables,
+            currentOdometerKm = 24_300f,
+            nowMs = nowMs
+        )
+        assertEquals(5, extras.daysSinceWash)
+        assertEquals(700, extras.nearestServiceKm)
+        assertTrue(extras.isServiceUrgent)
+    }
+
+    @Test
+    fun testBentoCanvasRendererFlowPhaseAndHub() {
+        val renderer = BentoCanvasRenderer()
+        assertFalse(renderer.isPointInCenterHub(400f, 240f))
+
+        val p1 = renderer.advanceFlowPhase(0.5f, HybridMode.TORQUE_ASSIST, 2000)
+        assertTrue("flowPhase should stay in [0, 1)", p1 in 0f..0.9999f)
+        assertTrue("flowPhase should advance > 0", p1 > 0f)
+
+        // Wrap around past 1.0f cleanly
+        repeat(4) {
+            renderer.advanceFlowPhase(0.5f, HybridMode.TORQUE_ASSIST, 2000)
+        }
+        assertTrue("Wrapped flowPhase must remain in [0, 1)", renderer.flowPhase in 0f..0.9999f)
+    }
+
+    @Test
+    fun testDtcDecoderKnownSuzukiAndFallbackCodes() {
+        val boost = DtcDecoder.decode("p0299")
+        assertEquals("P0299", boost.code)
+        assertEquals(DtcSeverity.WARNING, boost.severity)
+        assertTrue(boost.titleUk.contains("турб", ignoreCase = true) || boost.detailsUk.contains("наддув", ignoreCase = true))
+
+        val hybrid48v = DtcDecoder.decode("P0A80")
+        assertEquals(DtcSeverity.CRITICAL, hybrid48v.severity)
+        assertTrue(hybrid48v.titleUk.contains("48V") || hybrid48v.detailsUk.contains("48V"))
+
+        val unknown = DtcDecoder.decode("P0399")
+        assertEquals("P0399", unknown.code)
+        assertEquals("Запалювання", unknown.subsystemUk)
+
+        val searchTurbo = DtcDecoder.search("турб")
+        assertTrue(searchTurbo.any { it.code == "P0299" })
+        assertTrue(searchTurbo.any { it.code == "P0234" })
+    }
+
+    @Test
+    fun testBackupCsvAndZipRoundTripParsing() {
+        val now = 1_700_000_000_000L
+        val trips = listOf(
+            TripRecord(
+                id = 10L,
+                startTimeMs = now,
+                endTimeMs = now + 900_000L,
+                distanceKm = 12.5f,
+                fuelUsedLiters = 0.85f,
+                fuelCostUah = 48.0f,
+                avgConsumption100Km = 6.8f,
+                hybridSavedLiters = 0.08f,
+                hybridSavedUah = 4.5f,
+                ecoScore = 88,
+                careScore = 99,
+                remainingTankLiters = 38.9f,
+                csvFileName = "trip_1.csv"
+            )
+        )
+        val expenses = listOf(
+            ExpenseRecord(
+                id = 2L,
+                timestampMs = now + 60_000L,
+                category = ExpenseCategory.FUEL,
+                title = "АЗС OKKO",
+                amountUah = 1400f,
+                odometerKm = 15_250f,
+                liters = 24.5f,
+                pricePerLiter = 57.14f,
+                isFullTank = true,
+                isAutoDetected = false,
+                note = "АЗС OKKO, 95 Pulls"
+            )
+        )
+        val consumables = listOf(
+            ConsumableItem(
+                id = 3L,
+                name = "Зимовий комплект шин",
+                category = ExpenseCategory.TIRES,
+                intervalKm = 40_000,
+                intervalMonths = 60,
+                lastDoneKm = 10_000f,
+                lastDoneTimeMs = now,
+                accumulatedKm = 3_200f,
+                isTireSet = true,
+                tireSeason = TireSeason.WINTER,
+                isMounted = true,
+                purchasePriceUah = 18_000f,
+                note = "Bridgestone"
+            )
+        )
+
+        val baos = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(baos).use { zos ->
+            zos.putNextEntry(java.util.zip.ZipEntry("trips.csv"))
+            zos.write(buildTripsCsv(trips).toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+            zos.putNextEntry(java.util.zip.ZipEntry("expenses.csv"))
+            zos.write(buildExpensesCsv(expenses).toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+            zos.putNextEntry(java.util.zip.ZipEntry("service_book.csv"))
+            zos.write(buildConsumablesCsv(consumables, 15_250f).toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+        }
+
+        val parsed = BackupRestoreParser.readBackupZip(java.io.ByteArrayInputStream(baos.toByteArray()))
+        assertEquals(1, parsed.trips.size)
+        assertEquals(12.5f, parsed.trips[0].distanceKm, 0.01f)
+        assertEquals("trip_1.csv", parsed.trips[0].csvFileName)
+
+        assertEquals(1, parsed.expenses.size)
+        assertEquals("АЗС OKKO, 95 Pulls", parsed.expenses[0].note)
+        assertEquals(1400f, parsed.expenses[0].amountUah, 0.01f)
+        assertTrue(parsed.expenses[0].isFullTank)
+
+        assertEquals(1, parsed.consumables.size)
+        assertEquals(TireSeason.WINTER, parsed.consumables[0].tireSeason)
+        assertEquals(3_200f, parsed.consumables[0].accumulatedKm, 0.1f)
+    }
+
+    @Test
+    fun testCarWashReminderDueComputation() {
+        val now = 1_700_000_000_000L
+        val nineDaysAgo = now - 9L * 86_400_000L
+        val elevenDaysAgo = now - 11L * 86_400_000L
+
+        val recentWash = listOf(
+            ExpenseRecord(id = 1L, timestampMs = nineDaysAgo, category = ExpenseCategory.WASH, title = "Мийка", amountUah = 250f)
+        )
+        val notDue = computeAutoCockpitExtras(recentWash, emptyList(), 15_000f, nowMs = now, washReminderDays = 10)
+        assertEquals(9, notDue.daysSinceWash)
+        assertFalse(notDue.isWashDue)
+
+        val olderWash = listOf(
+            ExpenseRecord(id = 2L, timestampMs = elevenDaysAgo, category = ExpenseCategory.WASH, title = "Мийка", amountUah = 250f)
+        )
+        val due = computeAutoCockpitExtras(olderWash, emptyList(), 15_000f, nowMs = now, washReminderDays = 10)
+        assertEquals(11, due.daysSinceWash)
+        assertTrue(due.isWashDue)
     }
 }

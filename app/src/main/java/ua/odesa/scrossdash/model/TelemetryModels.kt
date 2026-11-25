@@ -91,5 +91,10 @@ data class AppSettings(
     val demoMode: Boolean = false,
     val themeMode: String = "AUTO", // "AUTO", "LIGHT", "DARK"
     val headlightsReminderEnabled: Boolean = false,
-    val odometerKm: Float = 0f
+    val odometerKm: Float = 0f,
+    val washReminderDays: Int = 14,
+    val autoParkingEnabled: Boolean = true,
+    val parkingLat: Double? = null,
+    val parkingLng: Double? = null,
+    val parkingTimestampMs: Long = 0L
 )

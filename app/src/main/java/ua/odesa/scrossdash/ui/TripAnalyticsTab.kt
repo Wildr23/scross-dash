@@ -1,5 +1,8 @@
 package ua.odesa.scrossdash.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -170,6 +173,7 @@ fun TripAnalyticsTab(
     var selectedPeriod by remember { mutableStateOf(AnalyticsPeriod.MONTH) }
     var tripPendingDelete by remember { mutableStateOf<TripRecord?>(null) }
     var showClearAllDialog by remember { mutableStateOf(false) }
+    var isArchiveExpanded by remember { mutableStateOf(false) }
 
     val uniqueTrips = remember(trips) { deduplicateTrips(trips) }
     val filteredTrips = remember(uniqueTrips, selectedPeriod) { filterTripsByPeriod(uniqueTrips, selectedPeriod) }
@@ -257,7 +261,7 @@ fun TripAnalyticsTab(
                 color = ext.textPrimary
             )
             Text(
-                text = "Аналітика витрат, 48V економії та історія поїздок",
+                text = "Аналітика витрат, MHEV економії та історія поїздок",
                 style = MaterialTheme.typography.bodySmall,
                 color = ext.textMuted
             )
@@ -365,7 +369,7 @@ fun TripAnalyticsTab(
                     )
                     KpiBox(
                         modifier = Modifier.weight(1f),
-                        label = "48V Економія",
+                        label = "MHEV економія",
                         value = String.format(Locale.US, "+%.2f л • %.0f ₴", kpi.totalHybridSavedLiters, kpi.totalHybridSavedUah),
                         color = ext.accentGreen
                     )
@@ -389,7 +393,7 @@ fun TripAnalyticsTab(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Eco ${kpi.avgEcoScore}/100  •  Бережл. ${kpi.avgCareScore}/100",
+                            text = "Водіння ${kpi.avgEcoScore}/100  •  Догляд ${kpi.avgCareScore}/100",
                             color = ext.accentPurple,
                             fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.bodySmall,
@@ -435,17 +439,39 @@ fun TripAnalyticsTab(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable { isArchiveExpanded = !isArchiveExpanded }
+                        .padding(vertical = 2.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "Архів поїздок (${filteredTrips.size})",
-                        color = ext.accentBlue,
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    if (uniqueTrips.isNotEmpty()) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Архів поїздок (${filteredTrips.size})",
+                            color = ext.accentBlue,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Surface(
+                            color = ext.selectedBlueBg,
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, ext.selectedBlueBorder)
+                        ) {
+                            Text(
+                                text = if (isArchiveExpanded) "Згорнути ▲" else "Розгорнути ▼",
+                                color = ext.selectedBlueFg,
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
+                    if (uniqueTrips.isNotEmpty() && isArchiveExpanded) {
                         TextButton(
                             onClick = { showClearAllDialog = true },
                             contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
@@ -481,112 +507,162 @@ fun TripAnalyticsTab(
                         style = MaterialTheme.typography.bodySmall
                     )
                 } else {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        filteredTrips.forEach { trip ->
-                            val hasCsv = csvFileExists(trip.csvFileName)
-                            val savedStr = if (trip.hybridSavedLiters < 0.10f) {
-                                "+${(trip.hybridSavedLiters * 1000f).roundToInt()} мл"
-                            } else {
-                                String.format(Locale.US, "+%.2f л", trip.hybridSavedLiters)
-                            }
-
-                            Surface(
-                                color = ext.archiveItemBg,
-                                border = BorderStroke(1.dp, ext.cardBorder),
-                                shape = RoundedCornerShape(14.dp),
-                                modifier = Modifier.fillMaxWidth()
+                    if (!isArchiveExpanded) {
+                        val latest = filteredTrips.first()
+                        Surface(
+                            color = ext.archiveItemBg,
+                            border = BorderStroke(1.dp, ext.cardBorder),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { isArchiveExpanded = true }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Column(
-                                    modifier = Modifier.padding(12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Остання: ${dateFormat.format(Date(latest.startTimeMs))}",
+                                        color = ext.textMuted,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                    Text(
+                                        text = String.format(
+                                            Locale.US,
+                                            "%.1f км • %.1f л/100км",
+                                            latest.distanceKm,
+                                            latest.avgConsumption100Km
+                                        ),
+                                        color = ext.textPrimary,
+                                        fontWeight = FontWeight.SemiBold,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                                Text(
+                                    text = "Показати всі (${filteredTrips.size}) ▼",
+                                    color = ext.accentBlue,
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            }
+                        }
+                    }
+
+                    AnimatedVisibility(
+                        visible = isArchiveExpanded,
+                        enter = expandVertically(),
+                        exit = shrinkVertically()
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            filteredTrips.forEach { trip ->
+                                val hasCsv = csvFileExists(trip.csvFileName)
+                                val savedStr = if (trip.hybridSavedLiters < 0.10f) {
+                                    "+${(trip.hybridSavedLiters * 1000f).roundToInt()} мл"
+                                } else {
+                                    String.format(Locale.US, "+%.2f л", trip.hybridSavedLiters)
+                                }
+
+                                Surface(
+                                    color = ext.archiveItemBg,
+                                    border = BorderStroke(1.dp, ext.cardBorder),
+                                    shape = RoundedCornerShape(14.dp),
+                                    modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
+                                    Column(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
                                         Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            Text(
-                                                text = dateFormat.format(Date(trip.startTimeMs)),
-                                                color = ext.textMuted,
-                                                style = MaterialTheme.typography.labelMedium
-                                            )
-                                            Icon(
-                                                imageVector = Icons.Rounded.DeleteOutline,
-                                                contentDescription = "Видалити поїздку",
-                                                tint = ext.textMuted,
-                                                modifier = Modifier
-                                                    .size(20.dp)
-                                                    .clip(RoundedCornerShape(4.dp))
-                                                    .clickable { tripPendingDelete = trip }
-                                                    .padding(2.dp)
-                                            )
-                                        }
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            Text(
-                                                text = String.format(Locale.US, "%.1f км", trip.distanceKm),
-                                                color = ext.textPrimary,
-                                                fontWeight = FontWeight.Bold,
-                                                style = MaterialTheme.typography.titleSmall
-                                            )
-                                            OutlinedButton(
-                                                onClick = { trip.csvFileName?.let(onExportTripCsv) },
-                                                enabled = hasCsv,
-                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                                                modifier = Modifier.height(30.dp),
-                                                shape = RoundedCornerShape(8.dp),
-                                                border = BorderStroke(1.dp, if (hasCsv) ext.accentBlue else ext.cardBorder),
-                                                colors = ButtonDefaults.outlinedButtonColors(
-                                                    contentColor = if (hasCsv) ext.accentBlue else ext.textMuted
-                                                )
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)
                                             ) {
                                                 Text(
-                                                    text = "📄 CSV",
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    fontWeight = FontWeight.Bold
+                                                    text = dateFormat.format(Date(trip.startTimeMs)),
+                                                    color = ext.textMuted,
+                                                    style = MaterialTheme.typography.labelMedium
+                                                )
+                                                Icon(
+                                                    imageVector = Icons.Rounded.DeleteOutline,
+                                                    contentDescription = "Видалити поїздку",
+                                                    tint = ext.textMuted,
+                                                    modifier = Modifier
+                                                        .size(20.dp)
+                                                        .clip(RoundedCornerShape(4.dp))
+                                                        .clickable { tripPendingDelete = trip }
+                                                        .padding(2.dp)
                                                 )
                                             }
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                Text(
+                                                    text = String.format(Locale.US, "%.1f км", trip.distanceKm),
+                                                    color = ext.textPrimary,
+                                                    fontWeight = FontWeight.Bold,
+                                                    style = MaterialTheme.typography.titleSmall
+                                                )
+                                                OutlinedButton(
+                                                    onClick = { trip.csvFileName?.let(onExportTripCsv) },
+                                                    enabled = hasCsv,
+                                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                                    modifier = Modifier.height(30.dp),
+                                                    shape = RoundedCornerShape(8.dp),
+                                                    border = BorderStroke(1.dp, if (hasCsv) ext.accentBlue else ext.cardBorder),
+                                                    colors = ButtonDefaults.outlinedButtonColors(
+                                                        contentColor = if (hasCsv) ext.accentBlue else ext.textMuted
+                                                    )
+                                                ) {
+                                                    Text(
+                                                        text = "📄 CSV",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                }
+                                            }
                                         }
-                                    }
 
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween
-                                    ) {
-                                        Text(
-                                            text = String.format(Locale.US, "Витрата: %.2f л (%.0f грн)", trip.fuelUsedLiters, trip.fuelCostUah),
-                                            color = ext.textSecondary,
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
-                                        Text(
-                                            text = String.format(Locale.US, "%.1f л/100км", trip.avgConsumption100Km),
-                                            color = ext.accentBlue,
-                                            fontWeight = FontWeight.Bold,
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
-                                    }
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                text = String.format(Locale.US, "Витрата: %.2f л (%.0f грн)", trip.fuelUsedLiters, trip.fuelCostUah),
+                                                color = ext.textSecondary,
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                            Text(
+                                                text = String.format(Locale.US, "%.1f л/100км", trip.avgConsumption100Km),
+                                                color = ext.accentBlue,
+                                                fontWeight = FontWeight.Bold,
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                        }
 
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween
-                                    ) {
-                                        Text(
-                                            text = String.format(Locale.US, "48V: %s (≈%.0f грн)", savedStr, trip.hybridSavedUah),
-                                            color = ext.accentGreen,
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
-                                        Text(
-                                            text = "Eco ${trip.ecoScore} • Бережл. ${trip.careScore}",
-                                            color = ext.accentPurple,
-                                            fontWeight = FontWeight.SemiBold,
-                                            style = MaterialTheme.typography.labelSmall
-                                        )
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text(
+                                                text = String.format(Locale.US, "MHEV: %s (≈%.0f грн)", savedStr, trip.hybridSavedUah),
+                                                color = ext.accentGreen,
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                            Text(
+                                                text = "Водіння ${trip.ecoScore} • Догляд ${trip.careScore}",
+                                                color = ext.accentPurple,
+                                                fontWeight = FontWeight.SemiBold,
+                                                style = MaterialTheme.typography.labelSmall
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -827,7 +903,7 @@ private fun SpendVsSavingsChartCard(buckets: List<ChartBucket>) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Витрати vs Економія 48V",
+                    text = "Витрати vs MHEV економія",
                     color = ext.textPrimary,
                     fontWeight = FontWeight.Bold,
                     style = MaterialTheme.typography.titleSmall,
@@ -838,7 +914,7 @@ private fun SpendVsSavingsChartCard(buckets: List<ChartBucket>) {
                 Spacer(modifier = Modifier.width(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     LegendDot("Витрати (₴)", spendBarColor)
-                    LegendDot("48V (₴)", savedBarColor)
+                    LegendDot("MHEV (₴)", savedBarColor)
                 }
             }
 
@@ -986,7 +1062,7 @@ private fun ScoresTrendChartCard(buckets: List<ChartBucket>) {
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    LegendDot("Eco", ecoColor)
+                    LegendDot("Водіння", ecoColor)
                     LegendDot("Догляд", careColor)
                 }
             }
@@ -1074,7 +1150,7 @@ private fun ScoresTrendChartCard(buckets: List<ChartBucket>) {
                     // Print exact values next to / above dots (clear and informative even on 1-day single dot)
                     if (count <= 5) {
                         val careStr = if (count == 1) "Догляд ${bucket.avgCare.roundToInt()}" else "${bucket.avgCare.roundToInt()}"
-                        val ecoStr = if (count == 1) "Eco ${bucket.avgEco.roundToInt()}" else "${bucket.avgEco.roundToInt()}"
+                        val ecoStr = if (count == 1) "Водіння ${bucket.avgEco.roundToInt()}" else "${bucket.avgEco.roundToInt()}"
                         val careLayout = textMeasurer.measure(careStr, careValStyle)
                         val ecoLayout = textMeasurer.measure(ecoStr, ecoValStyle)
 

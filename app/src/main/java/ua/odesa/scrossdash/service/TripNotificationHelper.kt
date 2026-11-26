@@ -71,7 +71,7 @@ class TripNotificationHelper(private val context: Context) {
                 trip.avgConsumption100Km,
                 trip.fuelCostUah
             )
-            val body = "Eco ${trip.ecoScore}/100 • Бережливість ${trip.careScore} • 48V $savedStr"
+            val body = "Водіння ${trip.ecoScore}/100 • Догляд ${trip.careScore} • MHEV $savedStr"
 
             val notification = NotificationCompat.Builder(context, SUMMARY_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_stat_scross)

@@ -55,11 +55,7 @@ class ObdTelemetryService : Service() {
 
         // Start in foreground immediately to satisfy Android foreground service requirements
         val initialNotification = buildNotification("Очікування проекції Android Auto...")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, initialNotification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(NOTIFICATION_ID, initialNotification)
-        }
+        startForegroundSafe(initialNotification)
 
         // Start observing Android Auto connection state
         carConnection = CarConnection(applicationContext).apply {
@@ -68,6 +64,24 @@ class ObdTelemetryService : Service() {
 
         // Idle Timeout Guard: If woken up by Bluetooth but projection does not start within 20s, shut down
         startIdleTimeoutGuard()
+    }
+
+    private fun startForegroundSafe(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val baseType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            val targetType = if (ParkingLocationHelper.hasLocationPermission(this)) {
+                baseType or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            } else {
+                baseType
+            }
+            try {
+                startForeground(NOTIFICATION_ID, notification, targetType)
+            } catch (_: SecurityException) {
+                startForeground(NOTIFICATION_ID, notification, baseType)
+            }
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -108,12 +122,12 @@ class ObdTelemetryService : Service() {
         val app = application as SCrossApplication
         app.telemetryEngine.setAndroidAutoProjectionActive(true)
         app.obdManager.start()
+        if (app.settingsRepository.settings.value.autoParkingEnabled) {
+            ParkingLocationHelper.updateCachedCarLocation(this)
+        }
 
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager?.notify(
-            NOTIFICATION_ID,
-            buildNotification("S-Cross 48V: запис телеметрії в Android Auto")
-        )
+        val activeNotification = buildNotification("S-Cross 48V: запис телеметрії в Android Auto")
+        startForegroundSafe(activeNotification)
     }
 
     private fun onProjectionEnded() {
@@ -121,6 +135,9 @@ class ObdTelemetryService : Service() {
         idleTimeoutJob?.cancel()
 
         val app = application as SCrossApplication
+        if (app.settingsRepository.settings.value.autoParkingEnabled) {
+            ParkingLocationHelper.updateCachedCarLocation(this)
+        }
         app.telemetryEngine.setAndroidAutoProjectionActive(false)
 
         if (app.telemetryEngine.isObdConnectedAndAwake() || app.telemetryEngine.isTripActiveNow()) {

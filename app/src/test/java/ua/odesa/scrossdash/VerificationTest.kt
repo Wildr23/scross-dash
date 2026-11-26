@@ -1534,4 +1534,144 @@ class VerificationTest {
         assertEquals(11, due.daysSinceWash)
         assertTrue(due.isWashDue)
     }
+
+    @Test
+    fun testIgnitionOffDeadBusNoPhantomSavingsAndFastFinalize() {
+        val settings = FakeSettingsStore(initialTankLiters = 38.0f, initialCalibrated = true)
+        val tripStore = FakeTripStore()
+        var finalizedReasonCount = 0
+        var locationSampleCalls = 0
+        val engine = TelemetryEngine(
+            settingsRepo = settings,
+            tripRepo = tripStore,
+            onTripFinalized = { finalizedReasonCount++ },
+            onCarLocationSampleRequested = { locationSampleCalls++ },
+            solarDarknessProvider = { false },
+            persistenceDispatcher = Dispatchers.Unconfined
+        )
+        engine.updateConnectionStatus(connected = true, demo = false, message = "Connected")
+
+        var ts = 1_700_000_000_000L
+        // 1. Drive 0.4 km so trip is real (>= 0.20 km)
+        for (i in 0 until 28) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 1800,
+                    speedKmh = 54,
+                    coolantTempC = 86,
+                    mafGramsPerSec = 8.0f,
+                    mapKpa = 95,
+                    throttlePct = 22f,
+                    engineLoadPct = 35f,
+                    voltage12v = 14.1f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertTrue(engine.isTripActiveNow())
+        assertTrue("Expected location sample during trip", locationSampleCalls >= 1)
+
+        // 2. Real traffic-light START_STOP on K14D: mapKpa=76, throttlePct=12f, maf=0.8f -> MUST still accumulate savings
+        val savedBeforeStartStop = engine.state.value.hybridSavedLiters
+        for (i in 0 until 10) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 0,
+                    speedKmh = 0,
+                    coolantTempC = 86,
+                    mafGramsPerSec = 0.8f,
+                    mapKpa = 76,
+                    throttlePct = 12f,
+                    engineLoadPct = 0f,
+                    voltage12v = 12.6f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertEquals(HybridMode.START_STOP, engine.state.value.hybridMode)
+        val savedAfterRealStartStop = engine.state.value.hybridSavedLiters
+        assertTrue(
+            "Real Start-Stop must still accumulate savings: $savedBeforeStartStop -> $savedAfterRealStartStop",
+            savedAfterRealStartStop > savedBeforeStartStop + 0.001f
+        )
+
+        // 3. Turn ignition OFF -> Suzuki ECU dead-bus signature (rpm=0, speed=0, maf=0, throttle=0, load=0, mapKpa=25)
+        for (i in 0 until 10) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 0,
+                    speedKmh = 0,
+                    coolantTempC = 86,
+                    mafGramsPerSec = 0f,
+                    mapKpa = 25,
+                    throttlePct = 0f,
+                    engineLoadPct = 0f,
+                    voltage12v = 12.5f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertTrue("Trip still pending at 10s (< 12s guard)", engine.isTripActiveNow())
+        assertNotEquals(
+            "Dead-bus ignition OFF must NOT be classified as START_STOP",
+            HybridMode.START_STOP,
+            engine.state.value.hybridMode
+        )
+        assertEquals(
+            "Dead-bus must add ZERO phantom hybrid savings",
+            savedAfterRealStartStop,
+            engine.state.value.hybridSavedLiters,
+            0.0001f
+        )
+
+        // Cross > 12s ECU_STANDBY_FINALIZE_SEC -> immediate archive & finalization
+        for (i in 0 until 4) {
+            ts += 1000L
+            engine.processSnapshot(
+                RawObdSnapshot(
+                    rpm = 0,
+                    speedKmh = 0,
+                    coolantTempC = 86,
+                    mafGramsPerSec = 0f,
+                    mapKpa = 25,
+                    throttlePct = 0f,
+                    engineLoadPct = 0f,
+                    voltage12v = 12.5f,
+                    timestampMs = ts
+                )
+            )
+        }
+        assertFalse("Trip must finalize cleanly after > 12s ignition-off dead-bus", engine.isTripActiveNow())
+        assertEquals(1, finalizedReasonCount)
+        assertEquals(1, tripStore.trips.value.size)
+        assertEquals(
+            "Archived trip must NOT contain phantom post-parking ml",
+            savedAfterRealStartStop,
+            tripStore.trips.value[0].hybridSavedLiters,
+            0.0005f
+        )
+    }
+
+    @Test
+    fun testParkingLocationCacheFallback() {
+        ua.odesa.scrossdash.service.ParkingLocationHelper.clearCachedLocation()
+        val now = 1_700_000_000_000L
+        assertNull(ua.odesa.scrossdash.service.ParkingLocationHelper.getCachedCarLocation(nowMs = now))
+
+        ua.odesa.scrossdash.service.ParkingLocationHelper.cacheLocationForTest(46.482526, 30.723309, now - 120_000L)
+        val fresh = ua.odesa.scrossdash.service.ParkingLocationHelper.getCachedCarLocation(nowMs = now)
+        assertNotNull(fresh)
+        assertEquals(46.482526, fresh!!.first, 0.000001)
+        assertEquals(30.723309, fresh.second, 0.000001)
+
+        val expired = ua.odesa.scrossdash.service.ParkingLocationHelper.getCachedCarLocation(
+            maxAgeMs = 600_000L,
+            nowMs = now + 700_000L
+        )
+        assertNull("Expired cache must return null", expired)
+        ua.odesa.scrossdash.service.ParkingLocationHelper.clearCachedLocation()
+    }
 }

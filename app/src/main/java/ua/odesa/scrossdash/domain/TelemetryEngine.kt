@@ -28,6 +28,7 @@ class TelemetryEngine(
     private val onTripFinalized: ((TripRecord) -> Unit)? = null,
     private val expenseStore: ExpenseStore? = null,
     private val onAutoRefuelDetected: ((AutoRefuelEvent) -> Unit)? = null,
+    private val onCarLocationSampleRequested: (() -> Unit)? = null,
     private val solarDarknessProvider: (Long) -> Boolean = { SolarTwilightHelper.isNightNow(it) },
     persistenceDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
@@ -93,6 +94,9 @@ class TelemetryEngine(
     private var stationarySec = 0f
     private var ecuSleepSec = 0f
     private var zeroRpmSec = 0f
+    private var deadBusShutdownSec = 0f
+    private var lastCarLocationSampleMs = 0L
+    private var wasMovingLastTick = false
     private var isAaProjectionActive = false
     private var isEcuAwake = false
     private var obdDisconnectedSinceMs = 0L
@@ -181,6 +185,7 @@ class TelemetryEngine(
         }
         ecuSleepSec = 0f
         zeroRpmSec = 0f
+        deadBusShutdownSec = 0f
         isEcuAwake = true
         obdDisconnectedSinceMs = 0L
         tripStartTankAnchorChecked = false
@@ -233,6 +238,9 @@ class TelemetryEngine(
         pendingOdometerDeltaKm = 0f
         ecuSleepSec = 0f
         zeroRpmSec = 0f
+        deadBusShutdownSec = 0f
+        lastCarLocationSampleMs = 0L
+        wasMovingLastTick = false
         tripStartTankAnchorChecked = false
         stationaryFuelSamples.clear()
         stationaryMedianPct = null
@@ -483,7 +491,31 @@ class TelemetryEngine(
             csvLogger?.logEvent("TRIP_START")
         }
 
-        // True ignition-off guard when ECU stays alive on ACC: continuous RPM == 0 for > 180s
+        // True ignition-off dead-bus guard on Suzuki K14D: ECU stops reporting live PIDs
+        // (rpm=0, speed=0, maf<=0.05, throttle<=0.5%, load<=0.5%, map<=26 coerced from NO DATA),
+        // whereas real Start-Stop keeps map=68..78 kPa & throttle>=11%.
+        val isIgnitionOffDeadBus = snap.rpm == 0 &&
+            snap.speedKmh == 0 &&
+            snap.mafGramsPerSec <= 0.05f &&
+            snap.throttlePct <= 0.5f &&
+            snap.engineLoadPct <= 0.5f &&
+            snap.mapKpa <= 26
+
+        if (isIgnitionOffDeadBus) {
+            if (isTripActive && !_state.value.isDemoMode && deadBusShutdownSec == 0f) {
+                lastCarLocationSampleMs = now
+                onCarLocationSampleRequested?.invoke()
+            }
+            deadBusShutdownSec += dtSec
+            if (isTripActive && deadBusShutdownSec > ECU_STANDBY_FINALIZE_SEC) {
+                finalizeAndArchiveTrip(postSummaryNotification = true, reason = "IGNITION_OFF_DEAD_BUS")
+                return
+            }
+        } else {
+            deadBusShutdownSec = 0f
+        }
+
+        // Fallback ignition-off guard when ECU stays alive on ACC: continuous RPM == 0 for > 180s
         if (snap.rpm == 0) {
             zeroRpmSec += dtSec
             if (isTripActive && zeroRpmSec > RPM_ZERO_FINALIZE_SEC) {
@@ -493,6 +525,18 @@ class TelemetryEngine(
         } else {
             zeroRpmSec = 0f
         }
+
+        // Periodically cache car GPS while driving and immediately upon coming to a stop
+        if (isTripActive && !_state.value.isDemoMode) {
+            val justStopped = wasMovingLastTick && snap.speedKmh <= 3
+            val periodicDue = (now - lastCarLocationSampleMs) >= 25_000L
+            val minGapOk = (now - lastCarLocationSampleMs) >= 8_000L
+            if ((justStopped && minGapOk) || periodicDue) {
+                lastCarLocationSampleMs = now
+                onCarLocationSampleRequested?.invoke()
+            }
+        }
+        wasMovingLastTick = snap.speedKmh > 5
 
         // 1. Instantaneous Fuel Consumption (MAF / Speed-Density + Lambda)
         val isEngineOff = snap.rpm < 250
@@ -557,7 +601,7 @@ class TelemetryEngine(
         val savedRateLitersPerHour: Float
 
         when {
-            isEngineOff && _state.value.isConnected -> {
+            isEngineOff && !isIgnitionOffDeadBus && _state.value.isConnected -> {
                 hybridMode = HybridMode.START_STOP
                 savedRateLitersPerHour = 0.70f
             }

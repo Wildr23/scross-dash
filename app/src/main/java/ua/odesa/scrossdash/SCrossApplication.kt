@@ -78,14 +78,26 @@ class SCrossApplication : Application() {
             csvLogger = csvLogger,
             onTripFinalized = { trip ->
                 if (settingsRepository.settings.value.autoParkingEnabled) {
-                    ParkingLocationHelper.captureLastKnownLocation(this)?.let { (lat, lng) ->
-                        settingsRepository.saveParkingLocation(lat, lng, trip.endTimeMs)
-                    }
+                    ParkingLocationHelper.captureBestParkingLocation(
+                        context = this,
+                        onSaved = { lat, lng, source ->
+                            settingsRepository.saveParkingLocation(lat, lng, trip.endTimeMs)
+                            csvLogger.logEvent("PARKING_PIN_SAVED:$source")
+                        },
+                        onFailed = { reason ->
+                            csvLogger.logEvent("PARKING_PIN_SKIPPED:$reason")
+                        }
+                    )
                 }
                 tripNotificationHelper.postArrivalSummary(trip)
             },
             expenseStore = expenseRepository,
-            onAutoRefuelDetected = { event -> tripNotificationHelper.postAutoRefuelNotice(event) }
+            onAutoRefuelDetected = { event -> tripNotificationHelper.postAutoRefuelNotice(event) },
+            onCarLocationSampleRequested = {
+                if (settingsRepository.settings.value.autoParkingEnabled) {
+                    ParkingLocationHelper.updateCachedCarLocation(this)
+                }
+            }
         )
         obdManager = Elm327BluetoothManager(this, settingsRepository, telemetryEngine)
     }

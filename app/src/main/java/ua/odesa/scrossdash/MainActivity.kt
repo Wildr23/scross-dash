@@ -13,6 +13,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
@@ -29,10 +30,12 @@ class MainActivity : ComponentActivity() {
 
     private var selectedInitialTab by mutableIntStateOf(0)
     private var tabTriggerKey by mutableIntStateOf(0)
+    private var hasLocationPermission by mutableStateOf(false)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
+        hasLocationPermission = ParkingLocationHelper.hasLocationPermission(this)
         val app = application as SCrossApplication
         app.obdManager.refreshPairedDevices()
         app.obdManager.start()
@@ -41,9 +44,10 @@ class MainActivity : ComponentActivity() {
     private val locationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        val granted = results[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-            results[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        if (granted) {
+        hasLocationPermission = results[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            results[Manifest.permission.ACCESS_COARSE_LOCATION] == true ||
+            ParkingLocationHelper.hasLocationPermission(this)
+        if (hasLocationPermission) {
             saveCurrentParkingPin()
         } else {
             Toast.makeText(this, "Надайте дозвіл на геолокацію для збереження парковки", Toast.LENGTH_SHORT).show()
@@ -77,6 +81,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         val app = application as SCrossApplication
+        hasLocationPermission = ParkingLocationHelper.hasLocationPermission(this)
         requestRuntimePermissions()
         app.obdManager.refreshPairedDevices()
         app.obdManager.start()
@@ -121,6 +126,7 @@ class MainActivity : ComponentActivity() {
                     csvStats = csvStats,
                     initialTab = selectedInitialTab,
                     tabTriggerKey = tabTriggerKey,
+                    hasLocationPermission = hasLocationPermission,
                     csvFileExists = { name -> app.csvLogger.logFileExists(name) },
                     onSelectDevice = { mac, name ->
                         app.settingsRepository.updateDevice(mac, name)
@@ -206,13 +212,16 @@ class MainActivity : ComponentActivity() {
 
     private fun saveCurrentParkingPin() {
         val app = application as SCrossApplication
-        val coords = ParkingLocationHelper.captureLastKnownLocation(this)
-        if (coords != null) {
-            app.settingsRepository.saveParkingLocation(coords.first, coords.second)
-            Toast.makeText(this, "Місце парковки збережено", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(this, "Не вдалося отримати GPS-координати. Увімкніть геолокацію.", Toast.LENGTH_SHORT).show()
-        }
+        ParkingLocationHelper.captureBestParkingLocation(
+            context = this,
+            onSaved = { lat, lng, _ ->
+                app.settingsRepository.saveParkingLocation(lat, lng)
+                Toast.makeText(this, "Місце парковки збережено", Toast.LENGTH_SHORT).show()
+            },
+            onFailed = {
+                Toast.makeText(this, "Не вдалося отримати GPS-координати. Увімкніть геолокацію.", Toast.LENGTH_SHORT).show()
+            }
+        )
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -227,6 +236,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        hasLocationPermission = ParkingLocationHelper.hasLocationPermission(this)
         val app = application as SCrossApplication
         app.obdManager.refreshPairedDevices()
         app.tripRepository.reloadTrips()

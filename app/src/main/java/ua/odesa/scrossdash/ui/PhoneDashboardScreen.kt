@@ -16,10 +16,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.DirectionsWalk
 import androidx.compose.material.icons.rounded.AccountBalanceWallet
 import androidx.compose.material.icons.rounded.BarChart
 import androidx.compose.material.icons.rounded.DirectionsCar
-import androidx.compose.material.icons.rounded.DirectionsWalk
 import androidx.compose.material.icons.rounded.LocalCarWash
 import androidx.compose.material.icons.rounded.LocationOn
 import androidx.compose.material.icons.rounded.Search
@@ -67,6 +67,7 @@ fun PhoneDashboardScreen(
     csvStats: CsvLogStats = CsvLogStats(),
     initialTab: Int = 0,
     tabTriggerKey: Int = 0,
+    hasLocationPermission: Boolean = true,
     csvFileExists: (String?) -> Boolean = { false },
     onSelectDevice: (String, String) -> Unit,
     onToggleDemo: (Boolean) -> Unit,
@@ -211,6 +212,7 @@ fun PhoneDashboardScreen(
                     pairedDevices = pairedDevices,
                     expenses = expenses,
                     csvStats = csvStats,
+                    hasLocationPermission = hasLocationPermission,
                     onSelectDevice = onSelectDevice,
                     onToggleDemo = onToggleDemo,
                     onFuelPriceChanged = onFuelPriceChanged,
@@ -278,6 +280,7 @@ private fun LiveDashboardTab(
     pairedDevices: List<BluetoothDevice>,
     expenses: List<ExpenseRecord>,
     csvStats: CsvLogStats,
+    hasLocationPermission: Boolean,
     onSelectDevice: (String, String) -> Unit,
     onToggleDemo: (Boolean) -> Unit,
     onFuelPriceChanged: (Float) -> Unit,
@@ -582,7 +585,7 @@ private fun LiveDashboardTab(
                     }
                     MetricTile(
                         modifier = Modifier.weight(1f),
-                        label = "48V Економія",
+                        label = "MHEV економія",
                         value = hybridSavedStr,
                         subText = "≈ ${state.hybridSavedUah.roundToInt()} грн",
                         valueColor = ext.accentGreen
@@ -596,7 +599,7 @@ private fun LiveDashboardTab(
                 ) {
                     ExpandableMetricTile(
                         modifier = Modifier.weight(1f),
-                        label = "Оцінка водіння",
+                        label = "Водіння",
                         value = "${state.eco.totalScore} / 100",
                         valueColor = when {
                             state.eco.totalScore >= 75 -> ext.accentGreen
@@ -608,7 +611,7 @@ private fun LiveDashboardTab(
                     )
                     ExpandableMetricTile(
                         modifier = Modifier.weight(1f),
-                        label = if (state.coolantTempC < 70) "Прогрів (${state.coolantTempC}°C)" else "Бережливість",
+                        label = if (state.coolantTempC < 70) "Прогрів (${state.coolantTempC}°C)" else "Догляд",
                         value = "${state.care.totalScore} / 100",
                         valueColor = if (state.coolantTempC < 70) ext.accentBlue else ext.accentPurple,
                         isExpanded = expandedCard == "care",
@@ -874,7 +877,7 @@ private fun LiveDashboardTab(
                             tint = if (isWashDue) ext.accentAmber else ext.accentCyan
                         )
                         Text(
-                            text = "Догляд та мийка авто",
+                            text = "Мийка авто",
                             color = ext.textPrimary,
                             fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.titleSmall
@@ -1012,7 +1015,7 @@ private fun LiveDashboardTab(
                             shape = RoundedCornerShape(12.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = ext.accentGreen, contentColor = Color.White)
                         ) {
-                            Icon(Icons.Rounded.DirectionsWalk, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Icon(Icons.AutoMirrored.Rounded.DirectionsWalk, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
                             Text("Маршрут до авто", maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
@@ -1026,15 +1029,24 @@ private fun LiveDashboardTab(
                         }
                     }
                 } else {
-                    Text(
-                        text = if (settings.autoParkingEnabled) {
-                            "Координати парковки збережуться автоматично при глушінні двигуна."
-                        } else {
-                            "Авто-збереження парковки вимкнене в налаштуваннях (⚙️)."
-                        },
-                        color = ext.textMuted,
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                    if (!hasLocationPermission) {
+                        Text(
+                            text = "⚠️ Надайте доступ до геолокації — без нього координати парковки не зберігаються після поїздки.",
+                            color = ext.accentAmber,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium
+                        )
+                    } else {
+                        Text(
+                            text = if (settings.autoParkingEnabled) {
+                                "Координати парковки збережуться автоматично при глушінні двигуна."
+                            } else {
+                                "Авто-збереження парковки вимкнене в налаштуваннях (⚙️)."
+                            },
+                            color = ext.textMuted,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                     OutlinedButton(
                         modifier = Modifier.fillMaxWidth(),
                         onClick = onSaveParkingNow,
@@ -1043,7 +1055,7 @@ private fun LiveDashboardTab(
                     ) {
                         Icon(Icons.Rounded.LocationOn, contentDescription = null, modifier = Modifier.size(17.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Зберегти місце зараз")
+                        Text(if (!hasLocationPermission) "Надати дозвіл і зберегти" else "Зберегти місце зараз")
                     }
                 }
             }
@@ -1184,7 +1196,7 @@ private fun EcoScoreDetailPanel(state: DashboardState) {
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text(
-                text = "Деталі оцінки водіння (0 → 100)",
+                text = "Деталі: Водіння (0 → 100)",
                 color = ext.accentGreen,
                 fontWeight = FontWeight.Bold,
                 style = MaterialTheme.typography.titleSmall
@@ -1203,7 +1215,7 @@ private fun EcoScoreDetailPanel(state: DashboardState) {
                 weight = "40%"
             )
             ScoreBar(
-                label = "Накат і рекуперація 48V",
+                label = "Накат і рекуперація MHEV",
                 score = state.eco.brakingRegen,
                 color = ext.accentGreen,
                 weight = "30%"
@@ -1248,7 +1260,7 @@ private fun CareScoreDetailPanel(state: DashboardState) {
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text(
-                text = "Деталі бережливості",
+                text = "Деталі: Догляд за авто",
                 color = ext.accentPurple,
                 fontWeight = FontWeight.Bold,
                 style = MaterialTheme.typography.titleSmall

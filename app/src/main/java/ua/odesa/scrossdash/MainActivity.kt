@@ -21,6 +21,9 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import ua.odesa.scrossdash.data.network.FuelChain
+import ua.odesa.scrossdash.data.network.FuelGrade
+import ua.odesa.scrossdash.data.network.SupabaseAuthResult
 import ua.odesa.scrossdash.service.ParkingLocationHelper
 import ua.odesa.scrossdash.service.TripNotificationHelper
 import ua.odesa.scrossdash.ui.PhoneDashboardScreen
@@ -161,10 +164,12 @@ class MainActivity : ComponentActivity() {
                     onConfirmPendingRefuel = {
                         app.expenseRepository.confirmPendingRefuel()
                         app.tripNotificationHelper.cancelRefuelNotice()
+                        app.scheduleSupabaseAutoBackup()
                     },
                     onConfirmPendingRefuelEdited = { edited ->
                         app.expenseRepository.confirmPendingRefuel(overrideRecord = edited)
                         app.tripNotificationHelper.cancelRefuelNotice()
+                        app.scheduleSupabaseAutoBackup()
                     },
                     onDismissPendingRefuel = {
                         app.expenseRepository.dismissPendingRefuel()
@@ -172,17 +177,35 @@ class MainActivity : ComponentActivity() {
                     },
                     onAddExpense = { record, linkedConsId ->
                         app.expenseRepository.addExpense(record, linkedConsId)
+                        app.scheduleSupabaseAutoBackup()
                     },
-                    onUpdateExpense = { app.expenseRepository.updateExpense(it) },
-                    onDeleteExpense = { app.expenseRepository.deleteExpense(it) },
-                    onAddConsumable = { app.expenseRepository.addConsumable(it) },
-                    onUpdateConsumable = { app.expenseRepository.updateConsumable(it) },
-                    onDeleteConsumable = { app.expenseRepository.deleteConsumable(it) },
+                    onUpdateExpense = {
+                        app.expenseRepository.updateExpense(it)
+                        app.scheduleSupabaseAutoBackup()
+                    },
+                    onDeleteExpense = {
+                        app.expenseRepository.deleteExpense(it)
+                        app.scheduleSupabaseAutoBackup()
+                    },
+                    onAddConsumable = {
+                        app.expenseRepository.addConsumable(it)
+                        app.scheduleSupabaseAutoBackup()
+                    },
+                    onUpdateConsumable = {
+                        app.expenseRepository.updateConsumable(it)
+                        app.scheduleSupabaseAutoBackup()
+                    },
+                    onDeleteConsumable = {
+                        app.expenseRepository.deleteConsumable(it)
+                        app.scheduleSupabaseAutoBackup()
+                    },
                     onSwitchTireSet = { targetId, swapCost, odoKm, note ->
                         app.expenseRepository.switchMountedTireSet(targetId, swapCost, odoKm, note)
+                        app.scheduleSupabaseAutoBackup()
                     },
                     onMarkConsumableServiced = { item, odoKm, costUah, note, resetTireKm ->
                         app.expenseRepository.markConsumableServiced(item, odoKm, costUah, note, resetTireKm)
+                        app.scheduleSupabaseAutoBackup()
                     },
                     onWashReminderDaysChanged = { app.settingsRepository.updateWashReminderDays(it) },
                     onAutoParkingChanged = { app.settingsRepository.setAutoParkingEnabled(it) },
@@ -204,6 +227,58 @@ class MainActivity : ComponentActivity() {
                     onClearParkingPin = { app.settingsRepository.clearParkingLocation() },
                     onRestoreFromZip = {
                         restoreZipLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "*/*"))
+                    },
+                    onFuelAutoPriceChanged = { enabled ->
+                        app.settingsRepository.setFuelAutoPriceEnabled(enabled)
+                        if (enabled) app.syncFuelPriceIfDue()
+                    },
+                    onFuelChainChanged = { chainKey ->
+                        app.settingsRepository.updatePreferredFuelChain(chainKey)
+                    },
+                    onFuelGradeChanged = { gradeKey ->
+                        app.settingsRepository.updatePreferredFuelGrade(gradeKey)
+                    },
+                    onRefreshFuelPriceNow = {
+                        app.refreshFuelPriceNow { res ->
+                            Toast.makeText(this@MainActivity, res.messageUk, Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    onHaSyncEnabledChanged = { app.settingsRepository.setHaSyncEnabled(it) },
+                    onHaWebhookUrlChanged = { app.settingsRepository.updateHaWebhookUrl(it) },
+                    onTestHaSyncNow = {
+                        app.pushTelemetryToHomeAssistant(markPendingOnFailure = false) { res ->
+                            Toast.makeText(this@MainActivity, res.messageUk, Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    onSupabaseSignUp = { email, password, onDone ->
+                        app.supabaseSignUp(email, password) { res ->
+                            Toast.makeText(this@MainActivity, res.messageUk, Toast.LENGTH_LONG).show()
+                            onDone(res)
+                        }
+                    },
+                    onSupabaseSignIn = { email, password, onDone ->
+                        app.supabaseSignIn(email, password) { res ->
+                            Toast.makeText(this@MainActivity, res.messageUk, Toast.LENGTH_SHORT).show()
+                            onDone(res)
+                        }
+                    },
+                    onSupabaseSignOut = {
+                        app.supabaseSignOut()
+                        Toast.makeText(this@MainActivity, "Вихід із Supabase виконано", Toast.LENGTH_SHORT).show()
+                    },
+                    onSupabaseAutoBackupChanged = { app.settingsRepository.setSupabaseAutoBackupEnabled(it) },
+                    onSupabaseEndpointChanged = { url, key -> app.settingsRepository.updateSupabaseEndpoint(url, key) },
+                    onSupabaseBackupNow = { onDone ->
+                        app.backupToSupabaseNow { res ->
+                            Toast.makeText(this@MainActivity, res.messageUk, Toast.LENGTH_LONG).show()
+                            onDone(res.messageUk)
+                        }
+                    },
+                    onSupabaseRestoreNow = { onDone ->
+                        app.restoreFromSupabaseNow { res ->
+                            Toast.makeText(this@MainActivity, res.messageUk, Toast.LENGTH_LONG).show()
+                            onDone(res.messageUk)
+                        }
                     }
                 )
             }
@@ -241,6 +316,9 @@ class MainActivity : ComponentActivity() {
         app.obdManager.refreshPairedDevices()
         app.tripRepository.reloadTrips()
         app.expenseRepository.reloadAll()
+        app.syncHomeAssistantIfPending()
+        app.syncFuelPriceIfDue()
+        app.syncSupabaseIfPending()
     }
 
     private fun requestRuntimePermissions() {

@@ -19,6 +19,8 @@ import ua.odesa.scrossdash.domain.SolarCalculator
 import ua.odesa.scrossdash.domain.SolarTwilightHelper
 import ua.odesa.scrossdash.domain.TelemetryEngine
 import ua.odesa.scrossdash.model.AppSettings
+import ua.odesa.scrossdash.model.DashboardState
+import ua.odesa.scrossdash.model.FuelTankInfo
 import ua.odesa.scrossdash.model.HybridMode
 import ua.odesa.scrossdash.model.RawObdSnapshot
 import ua.odesa.scrossdash.ui.AnalyticsPeriod
@@ -1673,5 +1675,221 @@ class VerificationTest {
         )
         assertNull("Expired cache must return null", expired)
         ua.odesa.scrossdash.service.ParkingLocationHelper.clearCachedLocation()
+    }
+
+    @Test
+    fun testHomeAssistantPayloadSerialization() {
+        val state = DashboardState(
+            coolantTempC = 89,
+            voltage12v = 12.62f,
+            fuelTank = FuelTankInfo(
+                remainingLiters = 38.8f,
+                remainingPct = 83,
+                estimatedRangeKm = 491
+            ),
+            dtcCodes = listOf("P0299")
+        )
+        val settingsNull = AppSettings(
+            odometerKm = 15250.4f,
+            parkingLat = null,
+            parkingLng = null
+        )
+        val extrasEmpty = AutoCockpitExtras()
+        val jsonNull = ua.odesa.scrossdash.service.HomeAssistantSyncClient.buildPayloadJson(
+            state = state,
+            settings = settingsNull,
+            extras = extrasEmpty,
+            lastTrip = null,
+            nowMs = 1_700_000_000_000L
+        )
+        assertTrue(jsonNull.contains("\"fuel_liters\":38.8"))
+        assertTrue(jsonNull.contains("\"range_km\":491"))
+        assertTrue(jsonNull.contains("\"voltage_12v\":12.62"))
+        assertTrue(jsonNull.contains("\"parking_lat\":null"))
+        assertTrue(jsonNull.contains("\"days_since_wash\":null"))
+        assertTrue(jsonNull.contains("\"dtc_count\":1"))
+
+        val settingsWithPin = settingsNull.copy(parkingLat = 46.482526, parkingLng = 30.723309)
+        val extrasFull = AutoCockpitExtras(
+            daysSinceWash = 5,
+            isWashDue = false,
+            nearestServiceKm = 4200,
+            isServiceUrgent = false
+        )
+        val lastTrip = TripRecord(
+            id = 1L,
+            startTimeMs = 1_699_999_000_000L,
+            endTimeMs = 1_699_999_600_000L,
+            distanceKm = 5.5f,
+            fuelUsedLiters = 0.43f,
+            fuelCostUah = 36f,
+            avgConsumption100Km = 7.9f,
+            hybridSavedLiters = 0.072f,
+            hybridSavedUah = 6.0f,
+            ecoScore = 77,
+            careScore = 99,
+            remainingTankLiters = 38.8f
+        )
+        val jsonFull = ua.odesa.scrossdash.service.HomeAssistantSyncClient.buildPayloadJson(
+            state = state,
+            settings = settingsWithPin,
+            extras = extrasFull,
+            lastTrip = lastTrip,
+            nowMs = 1_700_000_000_000L
+        )
+        assertTrue(jsonFull.contains("\"parking_lat\":46.482526"))
+        assertTrue(jsonFull.contains("\"parking_lng\":30.723309"))
+        assertTrue(jsonFull.contains("\"last_trip_avg_l100\":7.9"))
+        assertTrue(jsonFull.contains("\"last_trip_driving_score\":77"))
+        assertTrue(jsonFull.contains("\"days_since_wash\":5"))
+        assertTrue(jsonFull.contains("\"nearest_service_km\":4200"))
+    }
+
+    @Test
+    fun testUaFuelPriceMinfinParsingWithUkrnafta() {
+        val sampleChainsHtml = """
+            <table>
+              <tr><th>Оператор</th><th>А 95+</th><th>А 95</th><th>А 92</th><th>ДП</th><th>Газ</th></tr>
+              <tr><td>SOCAR</td><td></td><td>88,90</td><td>85,90</td><td></td><td>101,00</td><td>63,50</td></tr>
+              <tr><td>UKRNAFTA</td><td></td><td>82,90</td><td>79,90</td><td>77,90</td><td>95,90</td><td>61,05</td></tr>
+              <tr><td>UPG</td><td></td><td>82,90</td><td>80,90</td><td></td><td>95,33</td><td>60,90</td></tr>
+              <tr><td>WOG</td><td></td><td>87,90</td><td>84,90</td><td></td><td>99,99</td><td>62,90</td></tr>
+              <tr><td>ОККО</td><td></td><td>87,90</td><td>84,90</td><td></td><td>99,90</td><td>62,90</td></tr>
+            </table>
+        """.trimIndent()
+
+        val parsed = ua.odesa.scrossdash.data.network.UaFuelPriceClient.parseMinfinChainsHtml(sampleChainsHtml)
+        assertEquals(84.90f, parsed[ua.odesa.scrossdash.data.network.FuelChain.OKKO]!!.a95!!, 0.01f)
+        assertEquals(87.90f, parsed[ua.odesa.scrossdash.data.network.FuelChain.OKKO]!!.a95Plus!!, 0.01f)
+        assertEquals(84.90f, parsed[ua.odesa.scrossdash.data.network.FuelChain.WOG]!!.a95!!, 0.01f)
+        assertEquals(79.90f, parsed[ua.odesa.scrossdash.data.network.FuelChain.UKRNAFTA]!!.a95!!, 0.01f)
+        assertEquals(82.90f, parsed[ua.odesa.scrossdash.data.network.FuelChain.UKRNAFTA]!!.a95Plus!!, 0.01f)
+        assertEquals(80.90f, parsed[ua.odesa.scrossdash.data.network.FuelChain.UPG]!!.a95!!, 0.01f)
+        assertEquals(85.90f, parsed[ua.odesa.scrossdash.data.network.FuelChain.SOCAR]!!.a95!!, 0.01f)
+        assertNotNull(parsed[ua.odesa.scrossdash.data.network.FuelChain.AVG_UA]?.a95)
+
+        val summaryHtml = """
+            <table>
+              <tr><td>Бензин А-95 преміум</td><td>85,09</td><td>-0.04</td></tr>
+              <tr><td>Бензин А-95</td><td>81,49</td><td>-0.08</td></tr>
+            </table>
+        """.trimIndent()
+        val summary = ua.odesa.scrossdash.data.network.UaFuelPriceClient.parseMinfinSummaryHtml(summaryHtml)
+        assertNotNull(summary)
+        assertEquals(81.49f, summary!!.a95!!, 0.01f)
+        assertEquals(85.09f, summary.a95Plus!!, 0.01f)
+    }
+
+    @Test
+    fun testSupabaseJsonRoundTripAndSessionParsing() {
+        val userId = "11111111-2222-3333-4444-555555555555"
+        val trips = listOf(
+            TripRecord(
+                id = 1L,
+                startTimeMs = 1_700_000_000_000L,
+                endTimeMs = 1_700_000_600_000L,
+                distanceKm = 14.2f,
+                fuelUsedLiters = 1.04f,
+                fuelCostUah = 85.2f,
+                avgConsumption100Km = 7.3f,
+                hybridSavedLiters = 0.09f,
+                hybridSavedUah = 7.4f,
+                ecoScore = 85,
+                careScore = 99,
+                remainingTankLiters = 37.8f,
+                csvFileName = "trip_1.csv"
+            )
+        )
+        val tripsJson = ua.odesa.scrossdash.data.network.SupabaseSyncClient.buildTripsJsonArray(trips, userId)
+        val parsedTrips = ua.odesa.scrossdash.data.network.SupabaseSyncClient.parseTripsJsonArray(tripsJson)
+        assertEquals(1, parsedTrips.size)
+        assertEquals(1_700_000_000_000L, parsedTrips[0].startTimeMs)
+        assertEquals(14.2f, parsedTrips[0].distanceKm, 0.01f)
+        assertEquals("trip_1.csv", parsedTrips[0].csvFileName)
+
+        val expenses = listOf(
+            ExpenseRecord(
+                id = 2L,
+                timestampMs = 1_700_001_000_000L,
+                category = ExpenseCategory.FUEL,
+                title = "ОККО \"Pulls 95\"",
+                amountUah = 1500.5f,
+                odometerKm = 15300f,
+                liters = 17.5f,
+                pricePerLiter = 85.74f,
+                isFullTank = true,
+                isAutoDetected = true,
+                linkedItemId = null,
+                note = "Повний бак\nОдеса"
+            )
+        )
+        val expJson = ua.odesa.scrossdash.data.network.SupabaseSyncClient.buildExpensesJsonArray(expenses, userId)
+        assertTrue(expJson.contains("\"dedup_key\":"))
+        val parsedExp = ua.odesa.scrossdash.data.network.SupabaseSyncClient.parseExpensesJsonArray(expJson)
+        assertEquals(1, parsedExp.size)
+        assertEquals("ОККО \"Pulls 95\"", parsedExp[0].title)
+        assertEquals("Повний бак\nОдеса", parsedExp[0].note)
+        assertTrue(parsedExp[0].isFullTank)
+        assertEquals(17.5f, parsedExp[0].liters!!, 0.01f)
+
+        val consumables = listOf(
+            ConsumableItem(
+                id = 3L,
+                name = "Зимовий комплект",
+                category = ExpenseCategory.TIRES,
+                intervalKm = 45_000,
+                intervalMonths = 60,
+                lastDoneKm = 10_000f,
+                lastDoneTimeMs = 1_699_000_000_000L,
+                accumulatedKm = 2_450.5f,
+                isTireSet = true,
+                tireSeason = TireSeason.WINTER,
+                isMounted = true,
+                purchasePriceUah = 18_500f,
+                note = "Bridgestone"
+            )
+        )
+        val consJson = ua.odesa.scrossdash.data.network.SupabaseSyncClient.buildConsumablesJsonArray(consumables, userId)
+        val parsedCons = ua.odesa.scrossdash.data.network.SupabaseSyncClient.parseConsumablesJsonArray(consJson)
+        assertEquals(1, parsedCons.size)
+        assertEquals(TireSeason.WINTER, parsedCons[0].tireSeason)
+        assertTrue(parsedCons[0].isMounted)
+        assertEquals(2_450.5f, parsedCons[0].accumulatedKm, 0.1f)
+
+        val settingsObj = ua.odesa.scrossdash.data.network.SupabaseSyncClient.buildUserSettingsJsonObject(
+            settings = AppSettings(
+                odometerKm = 15_320f,
+                fuelPriceUah = 79.9f,
+                washReminderDays = 10,
+                preferredFuelChain = "UKRNAFTA",
+                parkingLat = 46.482526,
+                parkingLng = 30.723309,
+                parkingTimestampMs = 1_700_002_000_000L
+            ),
+            remainingTankLiters = 37.8f,
+            isTankCalibrated = true,
+            lastStationaryFuelPct = 80.5f,
+            userId = userId
+        )
+        val parsedSettings = ua.odesa.scrossdash.data.network.SupabaseSyncClient.parseUserSettingsJsonArray("[$settingsObj]")
+        assertNotNull(parsedSettings)
+        assertEquals("UKRNAFTA", parsedSettings!!.preferredFuelChain)
+        assertEquals(46.482526, parsedSettings.parkingLat!!, 0.000001)
+        assertTrue(parsedSettings.isTankCalibrated)
+
+        // Session parsing: valid login vs email-confirmation pending
+        val authJson = """
+            {"access_token":"tok123","refresh_token":"ref456","expires_in":3600,"expires_at":1800000000,"user":{"id":"$userId","email":"roman@example.com"}}
+        """.trimIndent()
+        val parsedSession = ua.odesa.scrossdash.data.network.SupabaseSyncClient.parseSessionJson(authJson)
+        assertNotNull(parsedSession)
+        assertEquals(userId, parsedSession!!.userId)
+        assertEquals("roman@example.com", parsedSession.email)
+
+        val unconfirmedSignupJson = """{"id":"$userId","email":"roman@example.com","confirmation_sent_at":"2026-11-27T12:00:00Z"}"""
+        assertNull(
+            "Unconfirmed signup without access_token must return null session",
+            ua.odesa.scrossdash.data.network.SupabaseSyncClient.parseSessionJson(unconfirmedSignupJson)
+        )
     }
 }

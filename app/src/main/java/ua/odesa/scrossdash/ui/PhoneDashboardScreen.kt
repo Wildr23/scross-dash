@@ -45,6 +45,7 @@ import ua.odesa.scrossdash.data.db.ExpenseCategory
 import ua.odesa.scrossdash.data.db.ExpenseRecord
 import ua.odesa.scrossdash.data.db.TripRecord
 import ua.odesa.scrossdash.data.log.CsvLogStats
+import ua.odesa.scrossdash.data.network.SupabaseAuthResult
 import ua.odesa.scrossdash.domain.DtcDecoder
 import ua.odesa.scrossdash.domain.DtcSeverity
 import ua.odesa.scrossdash.model.AppSettings
@@ -104,7 +105,21 @@ fun PhoneDashboardScreen(
     onSaveParkingNow: () -> Unit = {},
     onOpenParkingMaps: (Double, Double) -> Unit = { _, _ -> },
     onClearParkingPin: () -> Unit = {},
-    onRestoreFromZip: () -> Unit = {}
+    onRestoreFromZip: () -> Unit = {},
+    onFuelAutoPriceChanged: (Boolean) -> Unit = {},
+    onFuelChainChanged: (String) -> Unit = {},
+    onFuelGradeChanged: (String) -> Unit = {},
+    onRefreshFuelPriceNow: () -> Unit = {},
+    onHaSyncEnabledChanged: (Boolean) -> Unit = {},
+    onHaWebhookUrlChanged: (String) -> Unit = {},
+    onTestHaSyncNow: () -> Unit = {},
+    onSupabaseSignUp: (String, String, (SupabaseAuthResult) -> Unit) -> Unit = { _, _, _ -> },
+    onSupabaseSignIn: (String, String, (SupabaseAuthResult) -> Unit) -> Unit = { _, _, _ -> },
+    onSupabaseSignOut: () -> Unit = {},
+    onSupabaseAutoBackupChanged: (Boolean) -> Unit = {},
+    onSupabaseEndpointChanged: (String, String) -> Unit = { _, _ -> },
+    onSupabaseBackupNow: ((String) -> Unit) -> Unit = {},
+    onSupabaseRestoreNow: ((String) -> Unit) -> Unit = {}
 ) {
     val ext = LocalSCrossColors.current
     var selectedTab by remember(initialTab, tabTriggerKey) {
@@ -234,7 +249,21 @@ fun PhoneDashboardScreen(
                     onSaveParkingNow = onSaveParkingNow,
                     onOpenParkingMaps = onOpenParkingMaps,
                     onClearParkingPin = onClearParkingPin,
-                    onAddExpense = onAddExpense
+                    onAddExpense = onAddExpense,
+                    onFuelAutoPriceChanged = onFuelAutoPriceChanged,
+                    onFuelChainChanged = onFuelChainChanged,
+                    onFuelGradeChanged = onFuelGradeChanged,
+                    onRefreshFuelPriceNow = onRefreshFuelPriceNow,
+                    onHaSyncEnabledChanged = onHaSyncEnabledChanged,
+                    onHaWebhookUrlChanged = onHaWebhookUrlChanged,
+                    onTestHaSyncNow = onTestHaSyncNow,
+                    onSupabaseSignUp = onSupabaseSignUp,
+                    onSupabaseSignIn = onSupabaseSignIn,
+                    onSupabaseSignOut = onSupabaseSignOut,
+                    onSupabaseAutoBackupChanged = onSupabaseAutoBackupChanged,
+                    onSupabaseEndpointChanged = onSupabaseEndpointChanged,
+                    onSupabaseBackupNow = onSupabaseBackupNow,
+                    onSupabaseRestoreNow = onSupabaseRestoreNow
                 )
                 1 -> TripAnalyticsTab(
                     trips = trips,
@@ -302,7 +331,21 @@ private fun LiveDashboardTab(
     onSaveParkingNow: () -> Unit,
     onOpenParkingMaps: (Double, Double) -> Unit,
     onClearParkingPin: () -> Unit,
-    onAddExpense: (ExpenseRecord, Long?) -> Unit
+    onAddExpense: (ExpenseRecord, Long?) -> Unit,
+    onFuelAutoPriceChanged: (Boolean) -> Unit,
+    onFuelChainChanged: (String) -> Unit,
+    onFuelGradeChanged: (String) -> Unit,
+    onRefreshFuelPriceNow: () -> Unit,
+    onHaSyncEnabledChanged: (Boolean) -> Unit,
+    onHaWebhookUrlChanged: (String) -> Unit,
+    onTestHaSyncNow: () -> Unit,
+    onSupabaseSignUp: (String, String, (SupabaseAuthResult) -> Unit) -> Unit,
+    onSupabaseSignIn: (String, String, (SupabaseAuthResult) -> Unit) -> Unit,
+    onSupabaseSignOut: () -> Unit,
+    onSupabaseAutoBackupChanged: (Boolean) -> Unit,
+    onSupabaseEndpointChanged: (String, String) -> Unit,
+    onSupabaseBackupNow: ((String) -> Unit) -> Unit,
+    onSupabaseRestoreNow: ((String) -> Unit) -> Unit
 ) {
     val ext = LocalSCrossColors.current
     val cardBorder = BorderStroke(1.dp, ext.cardBorder)
@@ -329,7 +372,21 @@ private fun LiveDashboardTab(
             onExportAllZip = onExportAllZip,
             onRestoreFromZip = onRestoreFromZip,
             onExportCsv = onExportCsv,
-            onClearCsvLogs = onClearCsvLogs
+            onClearCsvLogs = onClearCsvLogs,
+            onFuelAutoPriceChanged = onFuelAutoPriceChanged,
+            onFuelChainChanged = onFuelChainChanged,
+            onFuelGradeChanged = onFuelGradeChanged,
+            onRefreshFuelPriceNow = onRefreshFuelPriceNow,
+            onHaSyncEnabledChanged = onHaSyncEnabledChanged,
+            onHaWebhookUrlChanged = onHaWebhookUrlChanged,
+            onTestHaSyncNow = onTestHaSyncNow,
+            onSupabaseSignUp = onSupabaseSignUp,
+            onSupabaseSignIn = onSupabaseSignIn,
+            onSupabaseSignOut = onSupabaseSignOut,
+            onSupabaseAutoBackupChanged = onSupabaseAutoBackupChanged,
+            onSupabaseEndpointChanged = onSupabaseEndpointChanged,
+            onSupabaseBackupNow = onSupabaseBackupNow,
+            onSupabaseRestoreNow = onSupabaseRestoreNow
         )
     }
 

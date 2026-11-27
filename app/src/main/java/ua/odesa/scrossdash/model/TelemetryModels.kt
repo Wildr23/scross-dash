@@ -1,5 +1,9 @@
 package ua.odesa.scrossdash.model
 
+const val DEFAULT_HA_WEBHOOK_URL = "http://192.168.3.100:8123/api/webhook/scross_dash_9f4b2c7e8a1d4f60b3e5a9c1"
+const val DEFAULT_SUPABASE_URL = "https://lvvupeqkzuxolfjlkrio.supabase.co"
+const val DEFAULT_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_sIK7fQf-M10NrxeWsw4OYg_UNfqYMQl"
+
 enum class HybridMode(val label: String, val badge: String) {
     START_STOP("Старт-Стоп (ДВЗ вимк.)", "🛑 СТАРТ-СТОП"),
     TORQUE_ASSIST("48V Електропідхват", "⚡ ПІДХВАТ 48V"),
@@ -96,5 +100,18 @@ data class AppSettings(
     val autoParkingEnabled: Boolean = true,
     val parkingLat: Double? = null,
     val parkingLng: Double? = null,
-    val parkingTimestampMs: Long = 0L
+    val parkingTimestampMs: Long = 0L,
+    val haSyncEnabled: Boolean = true,
+    val haWebhookUrl: String = DEFAULT_HA_WEBHOOK_URL,
+    val haLastSyncMs: Long = 0L,
+    val fuelAutoPriceEnabled: Boolean = false,
+    val preferredFuelChain: String = "OKKO",
+    val preferredFuelGrade: String = "A95",
+    val lastFuelPriceSyncMs: Long = 0L,
+    val supabaseUrl: String = DEFAULT_SUPABASE_URL,
+    val supabaseKey: String = DEFAULT_SUPABASE_PUBLISHABLE_KEY,
+    val supabaseEmail: String = "",
+    val supabaseUserId: String = "",
+    val supabaseAutoBackupEnabled: Boolean = true,
+    val supabaseLastSyncMs: Long = 0L
 )

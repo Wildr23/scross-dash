@@ -17,6 +17,8 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.LocalCarWash
 import androidx.compose.material.icons.rounded.Restore
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -25,6 +27,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -32,9 +36,14 @@ import androidx.compose.ui.window.DialogProperties
 import ua.odesa.scrossdash.data.db.ExpenseCategory
 import ua.odesa.scrossdash.data.db.ExpenseRecord
 import ua.odesa.scrossdash.data.log.CsvLogStats
+import ua.odesa.scrossdash.data.network.FuelChain
+import ua.odesa.scrossdash.data.network.FuelGrade
+import ua.odesa.scrossdash.data.network.SupabaseAuthResult
 import ua.odesa.scrossdash.domain.DtcDecoder
 import ua.odesa.scrossdash.domain.DtcSeverity
 import ua.odesa.scrossdash.model.AppSettings
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 @SuppressLint("MissingPermission")
@@ -55,13 +64,68 @@ fun SettingsDialog(
     onExportAllZip: () -> Unit,
     onRestoreFromZip: () -> Unit,
     onExportCsv: () -> Unit,
-    onClearCsvLogs: () -> Unit
+    onClearCsvLogs: () -> Unit,
+    onFuelAutoPriceChanged: (Boolean) -> Unit = {},
+    onFuelChainChanged: (String) -> Unit = {},
+    onFuelGradeChanged: (String) -> Unit = {},
+    onRefreshFuelPriceNow: () -> Unit = {},
+    onHaSyncEnabledChanged: (Boolean) -> Unit = {},
+    onHaWebhookUrlChanged: (String) -> Unit = {},
+    onTestHaSyncNow: () -> Unit = {},
+    onSupabaseSignUp: (String, String, (SupabaseAuthResult) -> Unit) -> Unit = { _, _, _ -> },
+    onSupabaseSignIn: (String, String, (SupabaseAuthResult) -> Unit) -> Unit = { _, _, _ -> },
+    onSupabaseSignOut: () -> Unit = {},
+    onSupabaseAutoBackupChanged: (Boolean) -> Unit = {},
+    onSupabaseEndpointChanged: (String, String) -> Unit = { _, _ -> },
+    onSupabaseBackupNow: ((String) -> Unit) -> Unit = {},
+    onSupabaseRestoreNow: ((String) -> Unit) -> Unit = {}
 ) {
     val ext = LocalSCrossColors.current
     val cardBorder = BorderStroke(1.dp, ext.cardBorder)
     var priceText by remember(settings.fuelPriceUah) { mutableStateOf(settings.fuelPriceUah.toString()) }
     var calibText by remember(settings.mafCalibration) { mutableStateOf(settings.mafCalibration.toString()) }
+    var haUrlText by remember { mutableStateOf(settings.haWebhookUrl) }
+    var sbEmail by remember { mutableStateOf(settings.supabaseEmail) }
+    var sbPassword by remember { mutableStateOf("") }
+    var sbPasswordVisible by remember { mutableStateOf(false) }
+    var sbBusy by remember { mutableStateOf(false) }
+    var sbStatusBanner by remember { mutableStateOf<String?>(null) }
+    var sbUrlText by remember { mutableStateOf(settings.supabaseUrl) }
+    var sbKeyText by remember { mutableStateOf(settings.supabaseKey) }
+    var showSbEndpointFields by remember { mutableStateOf(false) }
+    var showCloudRestoreConfirm by remember { mutableStateOf(false) }
+    val syncDateFmt = remember { SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()) }
     var showAllBtDevices by remember { mutableStateOf(false) }
+
+    if (showCloudRestoreConfirm) {
+        AlertDialog(
+            onDismissRequest = { showCloudRestoreConfirm = false },
+            containerColor = ext.card,
+            titleContentColor = ext.textPrimary,
+            textContentColor = ext.textSecondary,
+            title = { Text("Відновити дані з Supabase?", fontWeight = FontWeight.Bold) },
+            text = { Text("Поїздки, витрати та ТО з хмари буде безпечно об'єднано з локальною базою без дублікатів.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showCloudRestoreConfirm = false
+                        sbBusy = true
+                        onSupabaseRestoreNow { msg ->
+                            sbBusy = false
+                            sbStatusBanner = msg
+                        }
+                    }
+                ) {
+                    Text("Відновити", color = ext.accentBlue, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCloudRestoreConfirm = false }) {
+                    Text("Скасувати", color = ext.textMuted)
+                }
+            }
+        )
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -455,6 +519,397 @@ fun SettingsDialog(
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(12.dp)
                             )
+
+                            HorizontalDivider(color = ext.divider, thickness = 1.dp)
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(end = 12.dp)
+                                ) {
+                                    Text(
+                                        text = "⛽ Авто-ціни українських АЗС",
+                                        color = ext.textPrimary,
+                                        fontWeight = FontWeight.SemiBold,
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    Text(
+                                        text = "Оновлення раз на добу з таблиці Мінфіну",
+                                        color = ext.textMuted,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                                Switch(
+                                    checked = settings.fuelAutoPriceEnabled,
+                                    onCheckedChange = onFuelAutoPriceChanged
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                FuelChain.entries.forEach { chain ->
+                                    val selected = settings.preferredFuelChain.equals(chain.key, ignoreCase = true)
+                                    FilterChip(
+                                        selected = selected,
+                                        onClick = { onFuelChainChanged(chain.key) },
+                                        label = { Text(chain.labelUk, style = MaterialTheme.typography.labelMedium) }
+                                    )
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                FuelGrade.entries.forEach { grade ->
+                                    val selected = settings.preferredFuelGrade.equals(grade.key, ignoreCase = true)
+                                    FilterChip(
+                                        selected = selected,
+                                        onClick = { onFuelGradeChanged(grade.key) },
+                                        label = { Text(grade.labelUk, style = MaterialTheme.typography.labelMedium) }
+                                    )
+                                }
+                                Spacer(modifier = Modifier.weight(1f))
+                                OutlinedButton(
+                                    onClick = onRefreshFuelPriceNow,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = cardBorder,
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Text("Оновити зараз", style = MaterialTheme.typography.labelMedium)
+                                }
+                            }
+
+                            if (settings.lastFuelPriceSyncMs > 0L) {
+                                Text(
+                                    text = "Останнє оновлення ціни: ${syncDateFmt.format(Date(settings.lastFuelPriceSyncMs))}",
+                                    color = ext.textMuted,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
+                        }
+                    }
+
+                    // Section 4.5: Home Assistant Webhook Telemetry Sync
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = ext.card),
+                        border = cardBorder,
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(end = 12.dp)
+                                ) {
+                                    Text(
+                                        text = "🏠 Home Assistant (Webhook)",
+                                        color = ext.accentBlue,
+                                        fontWeight = FontWeight.Bold,
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                    Text(
+                                        text = "Надсилати паливо, АКБ, мийку й ТО після поїздки",
+                                        color = ext.textMuted,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                                Switch(
+                                    checked = settings.haSyncEnabled,
+                                    onCheckedChange = onHaSyncEnabledChanged
+                                )
+                            }
+
+                            OutlinedTextField(
+                                value = haUrlText,
+                                onValueChange = {
+                                    haUrlText = it
+                                    onHaWebhookUrlChanged(it)
+                                },
+                                label = { Text("Webhook URL") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp)
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = if (settings.haLastSyncMs > 0L) {
+                                        "Синхр.: ${syncDateFmt.format(Date(settings.haLastSyncMs))}"
+                                    } else {
+                                        "Ще не синхронізовано"
+                                    },
+                                    color = ext.textMuted,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                                Button(
+                                    onClick = onTestHaSyncNow,
+                                    shape = RoundedCornerShape(10.dp),
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                                ) {
+                                    Text("Надіслати тест в HA", style = MaterialTheme.typography.labelMedium)
+                                }
+                            }
+                        }
+                    }
+
+                    // Section 4.8: Supabase Cloud Backup (Email/Password + RLS)
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = ext.card),
+                        border = cardBorder,
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "☁️ Хмарний бекап (Supabase)",
+                                    color = ext.accentBlue,
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.titleSmall
+                                )
+                                if (settings.supabaseUserId.isNotBlank()) {
+                                    TextButton(
+                                        onClick = {
+                                            sbPassword = ""
+                                            sbStatusBanner = null
+                                            onSupabaseSignOut()
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
+                                    ) {
+                                        Text("Вийти", color = ext.accentRed, style = MaterialTheme.typography.labelMedium)
+                                    }
+                                }
+                            }
+
+                            if (settings.supabaseUserId.isNotBlank()) {
+                                Surface(
+                                    color = ext.selectedGreenBg,
+                                    border = BorderStroke(1.dp, ext.selectedGreenBorder),
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = "✓ Акаунт: ${settings.supabaseEmail}",
+                                        color = ext.selectedGreenFg,
+                                        fontWeight = FontWeight.SemiBold,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                                    )
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .padding(end = 12.dp)
+                                    ) {
+                                        Text(
+                                            text = "Авто-бекап після поїздок і змін",
+                                            color = ext.textPrimary,
+                                            fontWeight = FontWeight.Medium,
+                                            style = MaterialTheme.typography.bodyMedium
+                                        )
+                                        Text(
+                                            text = if (settings.supabaseLastSyncMs > 0L) {
+                                                "Останній бекап: ${syncDateFmt.format(Date(settings.supabaseLastSyncMs))}"
+                                            } else {
+                                                "Ще не синхронізовано з хмарою"
+                                            },
+                                            color = ext.textMuted,
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                    Switch(
+                                        checked = settings.supabaseAutoBackupEnabled,
+                                        onCheckedChange = onSupabaseAutoBackupChanged
+                                    )
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Button(
+                                        onClick = {
+                                            sbBusy = true
+                                            onSupabaseBackupNow { msg ->
+                                                sbBusy = false
+                                                sbStatusBanner = msg
+                                            }
+                                        },
+                                        enabled = !sbBusy,
+                                        modifier = Modifier.weight(1f),
+                                        shape = RoundedCornerShape(12.dp)
+                                    ) {
+                                        Text("☁️ Бекап зараз", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { showCloudRestoreConfirm = true },
+                                        enabled = !sbBusy,
+                                        modifier = Modifier.weight(1f),
+                                        shape = RoundedCornerShape(12.dp),
+                                        border = cardBorder
+                                    ) {
+                                        Text("⬇️ З хмари", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            } else {
+                                Text(
+                                    text = "Створіть акаунт або увійдіть (Email + пароль) для автоматичного бекапу поїздок, витрат, ТО і парковки.",
+                                    color = ext.textMuted,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+
+                                OutlinedTextField(
+                                    value = sbEmail,
+                                    onValueChange = { sbEmail = it },
+                                    label = { Text("Email") },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                                    singleLine = true,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+
+                                OutlinedTextField(
+                                    value = sbPassword,
+                                    onValueChange = { sbPassword = it },
+                                    label = { Text("Пароль (мін. 6 символів)") },
+                                    singleLine = true,
+                                    visualTransformation = if (sbPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                                    trailingIcon = {
+                                        IconButton(onClick = { sbPasswordVisible = !sbPasswordVisible }) {
+                                            Icon(
+                                                imageVector = if (sbPasswordVisible) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                                contentDescription = "Показати пароль",
+                                                tint = ext.textMuted
+                                            )
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Button(
+                                        onClick = {
+                                            sbBusy = true
+                                            onSupabaseSignIn(sbEmail, sbPassword) { res ->
+                                                sbBusy = false
+                                                sbStatusBanner = res.messageUk
+                                                if (res.success && res.session != null) sbPassword = ""
+                                            }
+                                        },
+                                        enabled = !sbBusy,
+                                        modifier = Modifier.weight(1f),
+                                        shape = RoundedCornerShape(12.dp)
+                                    ) {
+                                        Text("Увійти")
+                                    }
+                                    OutlinedButton(
+                                        onClick = {
+                                            sbBusy = true
+                                            onSupabaseSignUp(sbEmail, sbPassword) { res ->
+                                                sbBusy = false
+                                                sbStatusBanner = res.messageUk
+                                                if (res.success && res.session != null) sbPassword = ""
+                                            }
+                                        },
+                                        enabled = !sbBusy,
+                                        modifier = Modifier.weight(1f),
+                                        shape = RoundedCornerShape(12.dp),
+                                        border = cardBorder
+                                    ) {
+                                        Text("Реєстрація")
+                                    }
+                                }
+
+                                TextButton(
+                                    onClick = { showSbEndpointFields = !showSbEndpointFields },
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                                ) {
+                                    Text(
+                                        text = if (showSbEndpointFields) "Сховати налаштування сервера ▲" else "Сервер SCrossDash (вже підключено) ▼",
+                                        color = ext.textMuted,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                }
+
+                                if (showSbEndpointFields) {
+                                    OutlinedTextField(
+                                        value = sbUrlText,
+                                        onValueChange = {
+                                            sbUrlText = it
+                                            onSupabaseEndpointChanged(it, sbKeyText)
+                                        },
+                                        label = { Text("Supabase URL") },
+                                        singleLine = true,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        shape = RoundedCornerShape(12.dp)
+                                    )
+                                    OutlinedTextField(
+                                        value = sbKeyText,
+                                        onValueChange = {
+                                            sbKeyText = it
+                                            onSupabaseEndpointChanged(sbUrlText, it)
+                                        },
+                                        label = { Text("Publishable API key") },
+                                        singleLine = true,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        shape = RoundedCornerShape(12.dp)
+                                    )
+                                }
+                            }
+
+                            sbStatusBanner?.let { banner ->
+                                Surface(
+                                    color = ext.infoBannerBg,
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = banner,
+                                        color = ext.textSecondary,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.padding(10.dp)
+                                    )
+                                }
+                            }
                         }
                     }
 

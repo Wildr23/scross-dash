@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import java.util.Locale
 
 class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, null, DATABASE_VERSION) {
 
@@ -53,6 +54,14 @@ class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_
         const val COL_CONS_IS_MOUNTED = "is_mounted"
         const val COL_CONS_PURCHASE_PRICE = "purchase_price_uah"
         const val COL_CONS_NOTE = "note"
+
+        fun expenseDedupKey(e: ExpenseRecord): String {
+            return "${e.timestampMs / 60_000L}|${e.category.key}|${e.title.trim()}|${(e.amountUah * 100f).toInt()}"
+        }
+
+        fun consumableDedupKey(c: ConsumableItem): String {
+            return "${c.name.trim().lowercase(Locale.US)}|${c.isTireSet}|${c.tireSeason?.key ?: ""}"
+        }
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -596,11 +605,8 @@ class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_
         db.beginTransaction()
         try {
             for (incoming in items) {
-                val match = existing.firstOrNull { ex ->
-                    ex.name.trim().equals(incoming.name.trim(), ignoreCase = true) &&
-                        ex.isTireSet == incoming.isTireSet &&
-                        ex.tireSeason == incoming.tireSeason
-                }
+                val incomingKey = consumableDedupKey(incoming)
+                val match = existing.firstOrNull { ex -> consumableDedupKey(ex) == incomingKey }
                 if (match == null) {
                     db.insert(TABLE_CONSUMABLES, null, toConsumableContentValues(incoming))
                     restored++
@@ -632,9 +638,5 @@ class TripDatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_
             db.endTransaction()
         }
         return restored
-    }
-
-    private fun expenseDedupKey(e: ExpenseRecord): String {
-        return "${e.timestampMs / 60_000L}|${e.category.key}|${e.title.trim()}|${(e.amountUah * 100f).toInt()}"
     }
 }

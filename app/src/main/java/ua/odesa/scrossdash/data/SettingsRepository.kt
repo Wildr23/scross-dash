@@ -5,6 +5,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import ua.odesa.scrossdash.model.AppSettings
+import ua.odesa.scrossdash.model.DEFAULT_HA_WEBHOOK_URL
+import ua.odesa.scrossdash.model.DEFAULT_SUPABASE_PUBLISHABLE_KEY
+import ua.odesa.scrossdash.model.DEFAULT_SUPABASE_URL
 import kotlin.math.abs
 
 interface SettingsStore {
@@ -75,7 +78,150 @@ class SettingsRepository(context: Context) : SettingsStore {
             autoParkingEnabled = prefs.getBoolean("auto_parking_enabled", true),
             parkingLat = parkingLat,
             parkingLng = parkingLng,
-            parkingTimestampMs = parkingTs
+            parkingTimestampMs = parkingTs,
+            haSyncEnabled = prefs.getBoolean("ha_sync_enabled", true),
+            haWebhookUrl = prefs.getString("ha_webhook_url", DEFAULT_HA_WEBHOOK_URL) ?: DEFAULT_HA_WEBHOOK_URL,
+            haLastSyncMs = prefs.getLong("ha_last_sync_ms", 0L),
+            fuelAutoPriceEnabled = prefs.getBoolean("fuel_auto_price_enabled", false),
+            preferredFuelChain = prefs.getString("preferred_fuel_chain", "OKKO") ?: "OKKO",
+            preferredFuelGrade = prefs.getString("preferred_fuel_grade", "A95") ?: "A95",
+            lastFuelPriceSyncMs = prefs.getLong("last_fuel_price_sync_ms", 0L),
+            supabaseUrl = prefs.getString("supabase_url", DEFAULT_SUPABASE_URL) ?: DEFAULT_SUPABASE_URL,
+            supabaseKey = prefs.getString("supabase_key", DEFAULT_SUPABASE_PUBLISHABLE_KEY) ?: DEFAULT_SUPABASE_PUBLISHABLE_KEY,
+            supabaseEmail = prefs.getString("supabase_email", "") ?: "",
+            supabaseUserId = prefs.getString("supabase_user_id", "") ?: "",
+            supabaseAutoBackupEnabled = prefs.getBoolean("supabase_auto_backup_enabled", true),
+            supabaseLastSyncMs = prefs.getLong("supabase_last_sync_ms", 0L)
+        )
+    }
+
+    fun getSupabaseAccessToken(): String = prefs.getString("supabase_access_token", "") ?: ""
+
+    fun getSupabaseRefreshToken(): String = prefs.getString("supabase_refresh_token", "") ?: ""
+
+    fun getSupabaseTokenExpiresAtSec(): Long = prefs.getLong("supabase_expires_at_sec", 0L)
+
+    fun isSupabaseSignedIn(): Boolean =
+        getSupabaseAccessToken().isNotBlank() &&
+            getSupabaseRefreshToken().isNotBlank() &&
+            _settings.value.supabaseUserId.isNotBlank()
+
+    fun isSupabaseBackupPending(): Boolean = prefs.getBoolean("supabase_backup_pending", false)
+
+    fun setSupabaseBackupPending(pending: Boolean) {
+        prefs.edit().putBoolean("supabase_backup_pending", pending).apply()
+    }
+
+    fun saveSupabaseSession(
+        accessToken: String,
+        refreshToken: String,
+        expiresAtSec: Long,
+        userId: String,
+        email: String
+    ) {
+        prefs.edit()
+            .putString("supabase_access_token", accessToken)
+            .putString("supabase_refresh_token", refreshToken)
+            .putLong("supabase_expires_at_sec", expiresAtSec)
+            .putString("supabase_user_id", userId)
+            .putString("supabase_email", email.trim())
+            .apply()
+        _settings.value = _settings.value.copy(
+            supabaseUserId = userId,
+            supabaseEmail = email.trim()
+        )
+    }
+
+    fun clearSupabaseSession(keepEmail: Boolean = true) {
+        val editor = prefs.edit()
+            .remove("supabase_access_token")
+            .remove("supabase_refresh_token")
+            .remove("supabase_expires_at_sec")
+            .remove("supabase_user_id")
+            .putBoolean("supabase_backup_pending", false)
+        if (!keepEmail) editor.remove("supabase_email")
+        editor.apply()
+        _settings.value = _settings.value.copy(
+            supabaseUserId = "",
+            supabaseEmail = if (keepEmail) _settings.value.supabaseEmail else ""
+        )
+    }
+
+    fun setSupabaseAutoBackupEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("supabase_auto_backup_enabled", enabled).apply()
+        _settings.value = _settings.value.copy(supabaseAutoBackupEnabled = enabled)
+    }
+
+    fun updateSupabaseEndpoint(url: String, publishableKey: String) {
+        val cleanUrl = url.trim().trimEnd('/').ifEmpty { DEFAULT_SUPABASE_URL }
+        val cleanKey = publishableKey.trim().ifEmpty { DEFAULT_SUPABASE_PUBLISHABLE_KEY }
+        prefs.edit()
+            .putString("supabase_url", cleanUrl)
+            .putString("supabase_key", cleanKey)
+            .apply()
+        _settings.value = _settings.value.copy(
+            supabaseUrl = cleanUrl,
+            supabaseKey = cleanKey
+        )
+    }
+
+    fun markSupabaseSynced(timestampMs: Long = System.currentTimeMillis()) {
+        prefs.edit()
+            .putLong("supabase_last_sync_ms", timestampMs)
+            .putBoolean("supabase_backup_pending", false)
+            .apply()
+        _settings.value = _settings.value.copy(supabaseLastSyncMs = timestampMs)
+    }
+
+    fun isHaPendingSync(): Boolean = prefs.getBoolean("ha_pending_sync", false)
+
+    fun setHaPendingSync(pending: Boolean) {
+        prefs.edit().putBoolean("ha_pending_sync", pending).apply()
+    }
+
+    fun setHaSyncEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("ha_sync_enabled", enabled).apply()
+        _settings.value = _settings.value.copy(haSyncEnabled = enabled)
+    }
+
+    fun updateHaWebhookUrl(url: String) {
+        val trimmed = url.trim()
+        prefs.edit().putString("ha_webhook_url", trimmed).apply()
+        _settings.value = _settings.value.copy(haWebhookUrl = trimmed)
+    }
+
+    fun markHaSynced(timestampMs: Long = System.currentTimeMillis()) {
+        prefs.edit()
+            .putLong("ha_last_sync_ms", timestampMs)
+            .putBoolean("ha_pending_sync", false)
+            .apply()
+        _settings.value = _settings.value.copy(haLastSyncMs = timestampMs)
+    }
+
+    fun setFuelAutoPriceEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("fuel_auto_price_enabled", enabled).apply()
+        _settings.value = _settings.value.copy(fuelAutoPriceEnabled = enabled)
+    }
+
+    fun updatePreferredFuelChain(chainKey: String) {
+        prefs.edit().putString("preferred_fuel_chain", chainKey).apply()
+        _settings.value = _settings.value.copy(preferredFuelChain = chainKey)
+    }
+
+    fun updatePreferredFuelGrade(gradeKey: String) {
+        prefs.edit().putString("preferred_fuel_grade", gradeKey).apply()
+        _settings.value = _settings.value.copy(preferredFuelGrade = gradeKey)
+    }
+
+    fun applySyncedFuelPrice(priceUah: Float, timestampMs: Long = System.currentTimeMillis()) {
+        val safePrice = priceUah.coerceIn(1f, 500f)
+        prefs.edit()
+            .putFloat("fuel_price_uah", safePrice)
+            .putLong("last_fuel_price_sync_ms", timestampMs)
+            .apply()
+        _settings.value = _settings.value.copy(
+            fuelPriceUah = safePrice,
+            lastFuelPriceSyncMs = timestampMs
         )
     }
 
